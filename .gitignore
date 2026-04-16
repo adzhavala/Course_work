@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.*
+
+# IDE/editor folders
+.idea/
+.vscode/
+.DS_Store
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Distribution artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+__pypackages__/
+
+# Pytest cache
+.pytest_cache/
+
+# ==========================================
+# СПЕЦИФІЧНО ДЛЯ ТВОГО ПРОЄКТУ (Астронавігація)
+# ==========================================
+
+# Локальні конфіги з паролями
+config_db.py
+
+# Великі бази даних та каталоги зірок
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# Зображення та результати
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# Локальні SQL дампи
+db_dump.sql
+backup*.sql
+*.tiff
+*.gif
+
+# SQL дампи та інші DB файли
+*.sql
+
+# Конфіги з паролями
+config_db.py

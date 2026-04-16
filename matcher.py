@@ -1,0 +1,156 @@
+import numpy as np
+import psycopg2
+from collections import defaultdict
+from scipy.spatial import KDTree
+from config_db import DB_CONFIG
+
+
+class StarMatcher:
+    def __init__(self, db_config=None, db_password=None):
+        """Initialize matcher and load triangle index."""
+        if db_config:
+            self.conn = psycopg2.connect(**db_config)
+        elif db_password:
+            self.conn = psycopg2.connect(dbname="course_work", user="postgres", password=db_password, host="localhost")
+        else:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+        self.tree = None
+        self.triangles_data = []
+
+        self._build_kdtree()
+
+    def _build_kdtree(self):
+        """Load triangle features and build KD-Tree."""
+        print("Loading triangle catalog from DB and building KD-Tree...")
+        cursor = self.conn.cursor()
+
+        try:
+            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2, orientation, ratio3 FROM star_triangles")
+        except Exception:
+            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2 FROM star_triangles")
+        rows = cursor.fetchall()
+
+        features = []
+        for row in rows:
+            hip1, hip2, hip3 = row[0], row[1], row[2]
+            ratio1, ratio2 = row[3], row[4]
+            ratio3 = row[6] if len(row) > 6 and row[6] is not None else (ratio1 / ratio2 if ratio2 else 0.0)
+            orientation = row[5] if len(row) > 5 and row[5] is not None else 0.0
+
+            feature_vec = np.array([ratio1, ratio2, ratio3, orientation], dtype=np.float64)
+            if not np.all(np.isfinite(feature_vec)):
+                continue
+
+            self.triangles_data.append((hip1, hip2, hip3, orientation))
+            features.append(feature_vec)
+
+        if not features:
+            self.tree = None
+            print("No valid triangles found for KD-Tree.")
+            cursor.close()
+            return
+
+        self.tree = KDTree(features)
+        print(f"KD-Tree successfully built for {len(features)} figures. Ready for search!")
+        cursor.close()
+
+    def find_best_match(self, img_ratio1, img_ratio2, img_ratio3, img_orientation, tolerance=0.01, k=20):
+        """Find nearest matches by ratios and orientation."""
+
+        if self.tree is None:
+            return []
+
+        query_pt = [img_ratio1, img_ratio2, img_ratio3, img_orientation]
+        distances, indices = self.tree.query(query_pt, k=k)
+
+        valid_matches = []
+
+        def score(feature_vec):
+            r1, r2, r3, orient = feature_vec
+            dr1 = abs(r1 - img_ratio1)
+            dr2 = abs(r2 - img_ratio2)
+            dr3 = abs(r3 - img_ratio3)
+            dorient = 0 if orient == 0 or img_orientation == 0 else abs(orient - img_orientation)
+            return dr1 + dr2 + dr3 + 2.0 * dorient
+
+        for dist, idx in zip(np.atleast_1d(distances), np.atleast_1d(indices)):
+            if idx >= len(self.triangles_data):
+                continue
+            hip1, hip2, hip3, orient = self.triangles_data[idx]
+            feature_vec = self.tree.data[idx]
+            if score(feature_vec) <= tolerance:
+                valid_matches.append({
+                    'star_hips': (hip1, hip2, hip3),
+                    'error': score(feature_vec)
+                })
+
+        return valid_matches
+
+    def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20):
+        """Aggregate matches from multiple triangles into confidence scores."""
+
+        if not triangles:
+            return {
+                'used_triangles': 0,
+                'matched_triangles': 0,
+                'candidates': []
+            }
+
+        aggregate = defaultdict(lambda: {'count': 0, 'error_sum': 0.0})
+        matched_triangles = 0
+
+        for t in triangles:
+            matches = self.find_best_match(
+                t['ratio1'],
+                t['ratio2'],
+                t['ratio3'],
+                t['orientation'],
+                tolerance=tolerance,
+                k=per_triangle_k
+            )
+
+            if not matches:
+                continue
+
+            matched_triangles += 1
+            seen_in_triangle = set()
+
+            for m in matches:
+                hips_key = tuple(sorted(m['star_hips']))
+                if hips_key in seen_in_triangle:
+                    continue
+                seen_in_triangle.add(hips_key)
+
+                aggregate[hips_key]['count'] += 1
+                aggregate[hips_key]['error_sum'] += m['error']
+
+        used_triangles = len(triangles)
+        candidates = []
+
+        for hips_key, stats in aggregate.items():
+            count = stats['count']
+            avg_error = stats['error_sum'] / count
+            support_ratio = count / used_triangles if used_triangles else 0.0
+            error_quality = 1.0 / (1.0 + 100.0 * avg_error)
+            confidence = 0.7 * support_ratio + 0.3 * error_quality
+
+            candidates.append({
+                'star_hips': hips_key,
+                'support_count': count,
+                'support_ratio': support_ratio,
+                'avg_error': avg_error,
+                'confidence': confidence
+            })
+
+        candidates.sort(key=lambda x: (-x['confidence'], -x['support_count'], x['avg_error']))
+
+        return {
+            'used_triangles': used_triangles,
+            'matched_triangles': matched_triangles,
+            'candidates': candidates
+        }
+
+    def close(self):
+        self.conn.close()
+
+
