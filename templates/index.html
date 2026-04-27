@@ -107,7 +107,13 @@
             <input
               type="checkbox"
               name="auto_tune"
-              {% if form_values.auto_tune == 'on' %}checked{% endif %}
+              {%
+              if
+              form_values.auto_tune=""
+              ="on"
+              %}checked{%
+              endif
+              %}
             />
             Автопідбір top_n / tolerance
           </label>
@@ -157,7 +163,9 @@
         <div class="card">
           <h3>Координатний розв'язок</h3>
           {% if not result.trustworthy %}
-          <p class="muted-text warn">Результат недостовірний: недостатньо надійних збігів.</p>
+          <p class="muted-text warn">
+            Результат недостовірний: недостатньо надійних збігів.
+          </p>
           {% endif %}
           <p>
             RA: <b>{{ '%.4f'|format(result.coordinate_solution.ra_deg) }}°</b>
@@ -184,10 +192,13 @@
           {% if result.coordinate_solution.triangle_pair_rms_deg is defined %}
           <p>
             Pair RMS:
-            <b>{{ '%.4f'|format(result.coordinate_solution.triangle_pair_rms_deg) }}°</b>
+            <b
+              >{{
+              '%.4f'|format(result.coordinate_solution.triangle_pair_rms_deg)
+              }}°</b
+            >
           </p>
-          {% endif %}
-          {% if result.coordinate_solution.spread_deg is defined %}
+          {% endif %} {% if result.coordinate_solution.spread_deg is defined %}
           <p>
             Spread:
             <b>{{ '%.4f'|format(result.coordinate_solution.spread_deg) }}°</b>
@@ -203,8 +214,8 @@
             Всього гіпотез:
             <b>{{ result.coordinate_solution.total_hypotheses }}</b>
           </p>
-          {% endif %} {% if result.quality_label %}
-          {% if result.coordinate_solution.max_triplet_support is defined %}
+          {% endif %} {% if result.quality_label %} {% if
+          result.coordinate_solution.max_triplet_support is defined %}
           <p>
             Підтримка HIP-трійки:
             <b>{{ result.coordinate_solution.max_triplet_support }}</b>
