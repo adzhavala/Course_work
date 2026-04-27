@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 from itertools import permutations
+from collections import Counter
 from coordinate_transforms import (
     angular_residuals_deg,
     cartesian_to_ra_dec,
@@ -235,6 +236,7 @@ def estimate_pointing_and_earth_coordinates(
         image_rays.append(pixel_to_camera_ray(star_obj.center, img.shape, fov_x_deg=fov_x_deg))
 
     image_brightness = [star_by_id[sid].brightness for sid in image_star_ids]
+    observed_pair_angles = _triangle_pair_angles_deg(image_rays)
 
     hip_ids = [int(h) for h in hip_triangle]
     vectors_map = star_db.get_star_vectors_by_hips(hip_ids)
@@ -249,6 +251,11 @@ def estimate_pointing_and_earth_coordinates(
 
     for perm in permutations(hip_ids):
         star_vectors = [vectors_map[hip] for hip in perm]
+        pair_rms_deg = _triangle_pair_rms_deg(image_rays, star_vectors)
+        if pair_rms_deg > 1.6:
+            # Reject catalog triangles that do not preserve observed angular scale.
+            continue
+
         if len(mags_map) == len(hip_ids):
             mags = [mags_map[hip] for hip in perm]
             cat_rank = sorted(range(len(mags)), key=lambda i: mags[i])
@@ -263,15 +270,17 @@ def estimate_pointing_and_earth_coordinates(
         except Exception:
             continue
 
-        # Penalize permutations that disagree in brightness ordering.
-        rms_deg += 0.4 * rank_mismatch
+        # Composite score: fit + pair-angle consistency + brightness-order consistency.
+        score = rms_deg + 0.8 * pair_rms_deg + 0.35 * rank_mismatch
 
-        if best is None or rms_deg < best['rms_deg']:
+        if best is None or score < best['score']:
             best = {
                 'perm': perm,
                 'rotation': r_ci,
                 'residuals_deg': residuals_deg,
                 'rms_deg': rms_deg,
+                'pair_rms_deg': pair_rms_deg,
+                'score': score,
             }
 
     if best is None:
@@ -301,8 +310,10 @@ def estimate_pointing_and_earth_coordinates(
         'r_eci': r_eci,
         'fit_rms_deg': best['rms_deg'],
         'fit_max_deg': float(np.max(best['residuals_deg'])),
+        'triangle_pair_rms_deg': best['pair_rms_deg'],
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': tuple(best['perm']),
+        'observed_pair_angles_deg': observed_pair_angles.tolist(),
     }
 
 
@@ -316,6 +327,27 @@ def _vector_angle_deg(v1, v2):
     return math.degrees(math.acos(c))
 
 
+def _triangle_pair_angles_deg(vectors):
+    """Return the 3 pairwise angular distances for a 3-vector set."""
+    if len(vectors) != 3:
+        raise ValueError("Expected exactly 3 vectors")
+
+    v0, v1, v2 = vectors
+    return np.array([
+        _vector_angle_deg(v0, v1),
+        _vector_angle_deg(v0, v2),
+        _vector_angle_deg(v1, v2),
+    ], dtype=np.float64)
+
+
+def _triangle_pair_rms_deg(vectors_a, vectors_b):
+    """RMS mismatch between pairwise angular distances of two 3-point sets."""
+    a = _triangle_pair_angles_deg(vectors_a)
+    b = _triangle_pair_angles_deg(vectors_b)
+    diff = a - b
+    return float(np.sqrt(np.mean(np.square(diff))))
+
+
 def estimate_pointing_multi_triangle(
     star_db,
     stars,
@@ -325,7 +357,7 @@ def estimate_pointing_multi_triangle(
     observation_time_utc=None,
     tolerance=0.015,
     per_triangle_k=3,
-    max_fit_rms_deg=6.0,
+    max_fit_rms_deg=5.0,
 ):
     """Aggregate multiple triangle hypotheses into one robust coordinate estimate."""
     hypotheses = []
@@ -356,6 +388,8 @@ def estimate_pointing_multi_triangle(
                 continue
             if sol['fit_rms_deg'] > max_fit_rms_deg:
                 continue
+            if float(sol.get('triangle_pair_rms_deg', sol['fit_rms_deg'])) > 1.2:
+                continue
 
             hypotheses.append({
                 'solution': sol,
@@ -366,12 +400,17 @@ def estimate_pointing_multi_triangle(
     if not hypotheses:
         return None
 
+    hips_support = Counter(tuple(sorted(h['solution']['used_hips'])) for h in hypotheses)
+
     vectors = []
     weights = []
     for h in hypotheses:
         fit = h['solution']['fit_rms_deg']
+        pair = float(h['solution'].get('triangle_pair_rms_deg', fit))
         err = h['match_error']
-        weight = 1.0 / ((0.2 + fit) ** 2 * (0.005 + err))
+        hips_key = tuple(sorted(h['solution']['used_hips']))
+        support_boost = 1.0 + 0.35 * max(0, hips_support[hips_key] - 1)
+        weight = support_boost / ((0.2 + fit) ** 2 * (0.2 + pair) * (0.005 + err))
         vectors.append(np.asarray(h['solution']['r_eci'], dtype=np.float64))
         weights.append(weight)
 
@@ -379,7 +418,7 @@ def estimate_pointing_multi_triangle(
     weights = np.asarray(weights, dtype=np.float64)
 
     # Keep only the densest angular cluster to suppress ambiguous false matches.
-    inlier_threshold_deg = 8.0
+    inlier_threshold_deg = 6.0
     best_inliers = None
     best_score = -1.0
 
@@ -418,6 +457,7 @@ def estimate_pointing_multi_triangle(
 
     hypotheses_in = [h for h, ok in zip(hypotheses, best_inliers) if ok]
     fit_values = [h['solution']['fit_rms_deg'] for h in hypotheses_in]
+    pair_values = [float(h['solution'].get('triangle_pair_rms_deg', h['solution']['fit_rms_deg'])) for h in hypotheses_in]
     spread_values = [_vector_angle_deg(h['solution']['r_eci'], r_eci_agg) for h in hypotheses_in]
     best_h = min(hypotheses_in, key=lambda x: x['solution']['fit_rms_deg'])
 
@@ -429,11 +469,13 @@ def estimate_pointing_multi_triangle(
         'r_eci': r_eci_agg,
         'fit_rms_deg': float(np.mean(fit_values)),
         'fit_max_deg': float(np.max(fit_values)),
+        'triangle_pair_rms_deg': float(np.mean(pair_values)),
         'spread_deg': float(np.mean(spread_values)),
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': best_h['solution']['used_hips'],
         'used_hypotheses': len(hypotheses_in),
         'total_hypotheses': len(hypotheses),
+        'max_triplet_support': int(max(hips_support.values()) if hips_support else 1),
         'best_triangle_id': best_h['triangle_id'],
     }
 

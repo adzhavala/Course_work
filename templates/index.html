@@ -181,6 +181,12 @@
             Fit Max:
             <b>{{ '%.4f'|format(result.coordinate_solution.fit_max_deg) }}°</b>
           </p>
+          {% if result.coordinate_solution.triangle_pair_rms_deg is defined %}
+          <p>
+            Pair RMS:
+            <b>{{ '%.4f'|format(result.coordinate_solution.triangle_pair_rms_deg) }}°</b>
+          </p>
+          {% endif %}
           {% if result.coordinate_solution.spread_deg is defined %}
           <p>
             Spread:
@@ -198,6 +204,12 @@
             <b>{{ result.coordinate_solution.total_hypotheses }}</b>
           </p>
           {% endif %} {% if result.quality_label %}
+          {% if result.coordinate_solution.max_triplet_support is defined %}
+          <p>
+            Підтримка HIP-трійки:
+            <b>{{ result.coordinate_solution.max_triplet_support }}</b>
+          </p>
+          {% endif %}
           <p>Якість: <b>{{ result.quality_label }}</b></p>
           {% endif %}
         </div>

@@ -118,13 +118,20 @@ def parse_int_with_default(raw_value: str, default: int) -> int:
 
 
 def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance):
-    triangles = generate_triangles_from_stars(stars, top_n=top_n, min_separation_px=12.0)
-    triangles_eval = triangles[:160]
+    probe_img = cv2.imread(str(image_path))
+    if probe_img is not None:
+        img_h, img_w = probe_img.shape[:2]
+        min_sep_px = max(10.0, min(24.0, 0.012 * img_w * (35.0 / max(10.0, fov_x_deg))))
+    else:
+        min_sep_px = 12.0
+
+    triangles = generate_triangles_from_stars(stars, top_n=top_n, min_separation_px=min_sep_px)
+    triangles_eval = triangles[:220]
 
     consensus = star_db.find_consensus_matches(
         triangles_eval[: min(12, len(triangles_eval))],
         tolerance=tolerance,
-        per_triangle_k=20,
+        per_triangle_k=30,
     )
 
     coordinate_solution = estimate_pointing_multi_triangle(
@@ -135,7 +142,7 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
         fov_x_deg=fov_x_deg,
         observation_time_utc=obs_time_utc,
         tolerance=tolerance,
-        per_triangle_k=3,
+        per_triangle_k=12,
         max_fit_rms_deg=6.0,
     )
 
@@ -170,9 +177,16 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
         score = 1e9 - top_conf
     else:
         fit = float(coordinate_solution.get("fit_rms_deg", 99.0))
+        pair = float(coordinate_solution.get("triangle_pair_rms_deg", fit))
         spread = float(coordinate_solution.get("spread_deg", fit))
         hypotheses = float(coordinate_solution.get("used_hypotheses", 1.0))
-        score = fit + 0.35 * spread + (1.0 - top_conf) * 1.4 - 0.15 * min(10.0, hypotheses)
+        score = (
+            fit
+            + 0.75 * pair
+            + 0.40 * spread
+            + (1.0 - top_conf) * 1.45
+            - 0.18 * min(10.0, hypotheses)
+        )
 
     return {
         "triangles": triangles_eval,
@@ -268,8 +282,8 @@ def index():
             )
 
             if auto_tune:
-                top_candidates = sorted({max(6, min(20, t)) for t in [top_n - 4, top_n - 2, top_n, top_n + 2, top_n + 4]})
-                tol_candidates = sorted({max(0.008, min(0.035, v)) for v in [tolerance * 0.75, tolerance, tolerance * 1.25, tolerance * 1.5]})
+                top_candidates = sorted({max(6, min(24, t)) for t in [top_n - 4, top_n - 2, top_n, top_n + 2, top_n + 4, top_n + 8, top_n + 12]})
+                tol_candidates = sorted({max(0.006, min(0.04, v)) for v in [tolerance * 0.60, tolerance * 0.80, tolerance, tolerance * 1.20, tolerance * 1.50, tolerance * 1.80]})
 
                 for tn in top_candidates:
                     for tol in tol_candidates:
@@ -321,19 +335,21 @@ def index():
 
             if coordinate_solution is not None:
                 fit_rms = float(coordinate_solution.get("fit_rms_deg", 999.0))
+                pair_rms = float(coordinate_solution.get("triangle_pair_rms_deg", fit_rms))
                 spread = float(coordinate_solution.get("spread_deg", fit_rms))
                 hypotheses = int(coordinate_solution.get("used_hypotheses", 1))
                 top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
 
-                if fit_rms < 0.2:
+                if fit_rms < 0.2 and pair_rms < 0.25:
                     result["quality_label"] = "Висока"
-                elif fit_rms < 0.7:
+                elif fit_rms < 0.7 and pair_rms < 0.7:
                     result["quality_label"] = "Середня"
                 else:
                     result["quality_label"] = "Низька"
 
                 result["trustworthy"] = (
                     fit_rms <= 1.2
+                    and pair_rms <= 1.0
                     and spread <= 3.0
                     and hypotheses >= 3
                     and top_conf >= 0.35
