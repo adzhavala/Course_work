@@ -302,6 +302,22 @@ def estimate_pointing_and_earth_coordinates(
     r_ecef = eci_to_ecef(r_eci, now_utc)
     lat_deg, lon_deg = ecef_to_lat_lon_deg(r_ecef)
 
+    excluded_hips = set(best['perm'])
+    remaining_stars = [s for s in stars if s.id not in image_star_ids]
+    remaining_stars = sorted(remaining_stars, key=lambda s: s.brightness, reverse=True)[:3]
+
+    quad_support_angles = []
+    quad_support_count = 0
+    for star_obj in remaining_stars:
+        star_ray = pixel_to_camera_ray(star_obj.center, img.shape, fov_x_deg=fov_x_deg)
+        star_eci = r_ci.T @ star_ray
+        star_eci = star_eci / np.linalg.norm(star_eci)
+        _, best_angle = star_db.find_nearest_catalog_star(star_eci, excluded_hips=excluded_hips)
+        if best_angle is not None:
+            quad_support_angles.append(best_angle)
+            if best_angle <= 1.0:
+                quad_support_count += 1
+
     return {
         'ra_deg': ra_deg,
         'dec_deg': dec_deg,
@@ -311,6 +327,9 @@ def estimate_pointing_and_earth_coordinates(
         'fit_rms_deg': best['rms_deg'],
         'fit_max_deg': float(np.max(best['residuals_deg'])),
         'triangle_pair_rms_deg': best['pair_rms_deg'],
+        'quad_support_count': quad_support_count,
+        'quad_support_best_deg': float(min(quad_support_angles)) if quad_support_angles else None,
+        'quad_support_mean_deg': float(np.mean(quad_support_angles)) if quad_support_angles else None,
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': tuple(best['perm']),
         'observed_pair_angles_deg': observed_pair_angles.tolist(),
@@ -346,6 +365,9 @@ def _triangle_pair_rms_deg(vectors_a, vectors_b):
     b = _triangle_pair_angles_deg(vectors_b)
     diff = a - b
     return float(np.sqrt(np.mean(np.square(diff))))
+
+
+
 
 
 def estimate_pointing_multi_triangle(
@@ -390,6 +412,8 @@ def estimate_pointing_multi_triangle(
                 continue
             if float(sol.get('triangle_pair_rms_deg', sol['fit_rms_deg'])) > 1.2:
                 continue
+            if len(stars) >= 6 and int(sol.get('quad_support_count', 0)) == 0:
+                continue
 
             hypotheses.append({
                 'solution': sol,
@@ -401,16 +425,21 @@ def estimate_pointing_multi_triangle(
         return None
 
     hips_support = Counter(tuple(sorted(h['solution']['used_hips'])) for h in hypotheses)
+    quad_supports = [int(h['solution'].get('quad_support_count', 0)) for h in hypotheses]
 
     vectors = []
     weights = []
     for h in hypotheses:
         fit = h['solution']['fit_rms_deg']
         pair = float(h['solution'].get('triangle_pair_rms_deg', fit))
+        quad_count = int(h['solution'].get('quad_support_count', 0))
+        quad_best = float(h['solution'].get('quad_support_best_deg', 99.0) or 99.0)
         err = h['match_error']
         hips_key = tuple(sorted(h['solution']['used_hips']))
         support_boost = 1.0 + 0.35 * max(0, hips_support[hips_key] - 1)
-        weight = support_boost / ((0.2 + fit) ** 2 * (0.2 + pair) * (0.005 + err))
+        quad_boost = 1.0 + 0.45 * quad_count
+        quad_penalty = 0.35 + quad_best
+        weight = support_boost * quad_boost / ((0.2 + fit) ** 2 * (0.2 + pair) * quad_penalty * (0.005 + err))
         vectors.append(np.asarray(h['solution']['r_eci'], dtype=np.float64))
         weights.append(weight)
 
@@ -458,6 +487,8 @@ def estimate_pointing_multi_triangle(
     hypotheses_in = [h for h, ok in zip(hypotheses, best_inliers) if ok]
     fit_values = [h['solution']['fit_rms_deg'] for h in hypotheses_in]
     pair_values = [float(h['solution'].get('triangle_pair_rms_deg', h['solution']['fit_rms_deg'])) for h in hypotheses_in]
+    quad_values = [int(h['solution'].get('quad_support_count', 0)) for h in hypotheses_in]
+    quad_best_values = [float(h['solution'].get('quad_support_best_deg', 99.0) or 99.0) for h in hypotheses_in]
     spread_values = [_vector_angle_deg(h['solution']['r_eci'], r_eci_agg) for h in hypotheses_in]
     best_h = min(hypotheses_in, key=lambda x: x['solution']['fit_rms_deg'])
 
@@ -470,12 +501,15 @@ def estimate_pointing_multi_triangle(
         'fit_rms_deg': float(np.mean(fit_values)),
         'fit_max_deg': float(np.max(fit_values)),
         'triangle_pair_rms_deg': float(np.mean(pair_values)),
+        'quad_support_count': int(np.max(quad_values)) if quad_values else 0,
+        'quad_support_best_deg': float(np.min(quad_best_values)) if quad_best_values else None,
         'spread_deg': float(np.mean(spread_values)),
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': best_h['solution']['used_hips'],
         'used_hypotheses': len(hypotheses_in),
         'total_hypotheses': len(hypotheses),
         'max_triplet_support': int(max(hips_support.values()) if hips_support else 1),
+        'max_quad_support': int(max(quad_supports) if quad_supports else 0),
         'best_triangle_id': best_h['triangle_id'],
     }
 

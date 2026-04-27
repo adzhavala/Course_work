@@ -187,6 +187,18 @@
             <b>{{ '%.4f'|format(result.coordinate_solution.triangle_pair_rms_deg) }}°</b>
           </p>
           {% endif %}
+          {% if result.coordinate_solution.quad_support_count is defined %}
+          <p>
+            4-та перевірка:
+            <b>{{ result.coordinate_solution.quad_support_count }}</b>
+          </p>
+          {% endif %}
+          {% if result.coordinate_solution.quad_support_best_deg is defined and result.coordinate_solution.quad_support_best_deg is not none %}
+          <p>
+            4-та найкраща похибка:
+            <b>{{ '%.4f'|format(result.coordinate_solution.quad_support_best_deg) }}°</b>
+          </p>
+          {% endif %}
           {% if result.coordinate_solution.spread_deg is defined %}
           <p>
             Spread:
@@ -208,6 +220,12 @@
           <p>
             Підтримка HIP-трійки:
             <b>{{ result.coordinate_solution.max_triplet_support }}</b>
+          </p>
+          {% endif %}
+          {% if result.coordinate_solution.max_quad_support is defined %}
+          <p>
+            Підтримка 4-точок:
+            <b>{{ result.coordinate_solution.max_quad_support }}</b>
           </p>
           {% endif %}
           <p>Якість: <b>{{ result.quality_label }}</b></p>

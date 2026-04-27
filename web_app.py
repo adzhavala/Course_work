@@ -178,14 +178,18 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
     else:
         fit = float(coordinate_solution.get("fit_rms_deg", 99.0))
         pair = float(coordinate_solution.get("triangle_pair_rms_deg", fit))
+        quad_support = float(coordinate_solution.get("quad_support_count", 0.0))
+        quad_best = float(coordinate_solution.get("quad_support_best_deg", 99.0) or 99.0)
         spread = float(coordinate_solution.get("spread_deg", fit))
         hypotheses = float(coordinate_solution.get("used_hypotheses", 1.0))
         score = (
             fit
             + 0.75 * pair
-            + 0.40 * spread
+            + 0.55 * quad_best
+            + 0.30 * spread
             + (1.0 - top_conf) * 1.45
-            - 0.18 * min(10.0, hypotheses)
+            - 0.22 * min(10.0, hypotheses)
+            - 0.12 * min(4.0, quad_support)
         )
 
     return {
@@ -336,13 +340,15 @@ def index():
             if coordinate_solution is not None:
                 fit_rms = float(coordinate_solution.get("fit_rms_deg", 999.0))
                 pair_rms = float(coordinate_solution.get("triangle_pair_rms_deg", fit_rms))
+                quad_support = int(coordinate_solution.get("quad_support_count", 0))
+                quad_best = float(coordinate_solution.get("quad_support_best_deg", 99.0) or 99.0)
                 spread = float(coordinate_solution.get("spread_deg", fit_rms))
                 hypotheses = int(coordinate_solution.get("used_hypotheses", 1))
                 top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
 
-                if fit_rms < 0.2 and pair_rms < 0.25:
+                if fit_rms < 0.2 and pair_rms < 0.25 and quad_best < 0.5:
                     result["quality_label"] = "Висока"
-                elif fit_rms < 0.7 and pair_rms < 0.7:
+                elif fit_rms < 0.7 and pair_rms < 0.7 and quad_best < 1.0:
                     result["quality_label"] = "Середня"
                 else:
                     result["quality_label"] = "Низька"
@@ -350,6 +356,8 @@ def index():
                 result["trustworthy"] = (
                     fit_rms <= 1.2
                     and pair_rms <= 1.0
+                    and quad_best <= 1.2
+                    and quad_support >= 1
                     and spread <= 3.0
                     and hypotheses >= 3
                     and top_conf >= 0.35

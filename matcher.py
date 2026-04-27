@@ -194,4 +194,48 @@ class StarMatcher:
             mags[int(hip)] = float(mag)
         return mags
 
+    def find_nearest_catalog_star(self, vector, excluded_hips=None):
+        """Find nearest catalog star to a given vector using KDTree (fast O(log N))."""
+        if not hasattr(self, '_catalog_vectors_cache'):
+            self._build_catalog_kdtree()
+        if self._catalog_kdtree is None:
+            return None, 180.0
+        excluded = set(excluded_hips or [])
+        vec = np.asarray(vector, dtype=np.float64)
+        vec = vec / np.linalg.norm(vec)
+        distances, indices = self._catalog_kdtree.query(vec, k=1)
+        if indices >= len(self._catalog_hips_list):
+            return None, 180.0
+        hip = self._catalog_hips_list[int(indices)]
+        if hip in excluded:
+            distances, indices = self._catalog_kdtree.query(vec, k=min(5, len(self._catalog_hips_list)))
+            for dist, idx in zip(np.atleast_1d(distances), np.atleast_1d(indices)):
+                if idx < len(self._catalog_hips_list) and self._catalog_hips_list[idx] not in excluded:
+                    hip = self._catalog_hips_list[int(idx)]
+                    break
+        catalog_vec = self._catalog_vectors_cache[hip]
+        angle = float(np.arccos(np.clip(np.dot(vec, catalog_vec / np.linalg.norm(catalog_vec)), -1.0, 1.0)))
+        angle_deg = np.degrees(angle)
+        return hip, angle_deg
+
+    def _build_catalog_kdtree(self):
+        """Build KDTree for all catalog stars (cached, built once)."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT hip_id, ra, dec FROM star_catalog ORDER BY hip_id")
+        rows = cursor.fetchall()
+        cursor.close()
+        self._catalog_vectors_cache = {}
+        self._catalog_hips_list = []
+        features = []
+        for hip, ra_deg, dec_deg in rows:
+            vec = ra_dec_to_cartesian(float(ra_deg), float(dec_deg), radius=1.0)
+            hip_int = int(hip)
+            self._catalog_vectors_cache[hip_int] = vec
+            self._catalog_hips_list.append(hip_int)
+            features.append(vec)
+        if features:
+            self._catalog_kdtree = KDTree(features)
+        else:
+            self._catalog_kdtree = None
+
 
