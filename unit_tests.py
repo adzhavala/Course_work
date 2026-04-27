@@ -4,6 +4,14 @@ unit_tests.py - Модульні тести для перевірки логік
 
 import math
 import unittest
+import numpy as np
+
+from coordinate_transforms import (
+    angular_separation_deg,
+    cartesian_to_ra_dec,
+    ra_dec_to_cartesian,
+    solve_vector_from_angular_constraints,
+)
 
 
 class TestTriangleCalculations(unittest.TestCase):
@@ -141,6 +149,55 @@ class TestAngularDistance(unittest.TestCase):
 
         self.assertAlmostEqual(distance, 90.0, places=3)
         print(f"Equator to pole: {distance:.3f}°")
+
+
+class TestCoordinateTransforms(unittest.TestCase):
+    """Тести переходів координат і системи (r, n_i) = R^2 cos(alpha_i)."""
+
+    def test_ra_dec_to_cartesian_axes(self):
+        v1 = ra_dec_to_cartesian(0.0, 0.0)
+        v2 = ra_dec_to_cartesian(90.0, 0.0)
+        v3 = ra_dec_to_cartesian(0.0, 90.0)
+
+        self.assertTrue(np.allclose(v1, np.array([1.0, 0.0, 0.0]), atol=1e-9))
+        self.assertTrue(np.allclose(v2, np.array([0.0, 1.0, 0.0]), atol=1e-9))
+        self.assertTrue(np.allclose(v3, np.array([0.0, 0.0, 1.0]), atol=1e-9))
+
+    def test_cartesian_roundtrip(self):
+        ra_in, dec_in = 123.4, -21.7
+        v = ra_dec_to_cartesian(ra_in, dec_in)
+        ra_out, dec_out = cartesian_to_ra_dec(v)
+
+        self.assertAlmostEqual(ra_out, ra_in, places=9)
+        self.assertAlmostEqual(dec_out, dec_in, places=9)
+
+    def test_solve_vector_from_angular_constraints(self):
+        # True pointing vector (unit sphere)
+        r_true = np.array([0.3, -0.4, 0.86602540378])
+        r_true = r_true / np.linalg.norm(r_true)
+
+        stars = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+
+        alphas_deg = []
+        for n in stars:
+            cos_alpha = float(np.dot(r_true, n))
+            cos_alpha = max(-1.0, min(1.0, cos_alpha))
+            alphas_deg.append(math.degrees(math.acos(cos_alpha)))
+
+        r_est, residuals = solve_vector_from_angular_constraints(stars, alphas_deg, radius=1.0)
+
+        self.assertTrue(np.allclose(r_est, r_true, atol=1e-8))
+        self.assertLess(float(np.linalg.norm(residuals)), 1e-8)
+
+    def test_angular_separation_consistency(self):
+        a = ra_dec_to_cartesian(10.0, 15.0)
+        b = ra_dec_to_cartesian(11.0, 15.0)
+        d = angular_separation_deg(a, b)
+        self.assertGreater(d, 0.0)
 
 
 if __name__ == "__main__":

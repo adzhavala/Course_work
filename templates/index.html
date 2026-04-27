@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Star Position Demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body>
+    <div class="bg-orb orb-1"></div>
+    <div class="bg-orb orb-2"></div>
+
+    <main class="page">
+      <section class="panel hero reveal">
+        <h1>Star Navigator Demo</h1>
+        <p>
+          Завантаж фото неба, вистав параметри й отримай кандидати каталогу,
+          RA/Dec та оцінку lat/lon.
+        </p>
+      </section>
+
+      <section class="panel form-panel reveal delay-1">
+        <form method="post" enctype="multipart/form-data" class="form-grid">
+          <label>
+            Фото неба (можна пропустити, щоб використати попереднє)
+            <input
+              id="imageInput"
+              type="file"
+              name="image"
+              accept=".png,.jpg,.jpeg,.bmp,.webp"
+            />
+          </label>
+
+          <div
+            class="paste-box"
+            id="pasteBox"
+            tabindex="0"
+            aria-label="Paste image area"
+          >
+            <p>
+              <b>Вставка з буфера:</b> натисни Ctrl+V або Cmd+V у цьому блоці.
+            </p>
+            <p class="muted-text" id="pasteStatus">Зараз файл не вставлено.</p>
+            <img id="pastedPreview" alt="Pasted preview" hidden />
+          </div>
+
+          {% if last_image_filename %}
+          <div class="hint">Останнє фото: <b>{{ last_image_filename }}</b></div>
+          {% endif %}
+
+          <label>
+            FOV по горизонталі (град)
+            <input
+              type="number"
+              step="0.1"
+              name="fov_x_deg"
+              value="{{ form_values.fov_x_deg }}"
+              required
+            />
+          </label>
+
+          <label>
+            Кількість яскравих зір (top_n)
+            <input
+              type="number"
+              name="top_n"
+              value="{{ form_values.top_n }}"
+              min="3"
+              max="30"
+              required
+            />
+          </label>
+
+          <label>
+            Tolerance матчінгу
+            <input
+              type="number"
+              step="0.001"
+              name="tolerance"
+              value="{{ form_values.tolerance }}"
+              min="0.001"
+              max="0.1"
+              required
+            />
+          </label>
+
+          <label>
+            UTC час спостереження (ISO, опціонально)
+            <input
+              type="text"
+              name="observation_time_utc"
+              value="{{ form_values.observation_time_utc }}"
+              placeholder="2026-04-26T21:15:00+00:00"
+            />
+          </label>
+
+          <label class="checkbox-line">
+            <input
+              type="checkbox"
+              name="auto_tune"
+              {% if form_values.auto_tune == 'on' %}checked{% endif %}
+            />
+            Автопідбір top_n / tolerance
+          </label>
+
+          <button type="submit">Запустити аналіз</button>
+        </form>
+      </section>
+
+      {% if error %}
+      <section class="panel error reveal">
+        <strong>Увага:</strong> {{ error }}
+      </section>
+      {% endif %} {% if result %}
+      <section class="panel result reveal delay-2">
+        <h2>Результат аналізу</h2>
+        <div class="stats">
+          <div class="chip">
+            Зір знайдено: <span>{{ result.stars_found }}</span>
+          </div>
+          <div class="chip">
+            Трикутників: <span>{{ result.triangles_found }}</span>
+          </div>
+          <div class="chip">FOV: <span>{{ result.fov_x_deg }}°</span></div>
+          <div class="chip">
+            UTC: <span>{{ result.observation_time_utc }}</span>
+          </div>
+          {% if result.auto_tuned %}
+          <div class="chip">
+            Auto-tune:
+            <span
+              >top_n={{ result.selected_top_n }}, tol={{
+              '%.4f'|format(result.selected_tolerance) }}</span
+            >
+          </div>
+          {% endif %}
+        </div>
+
+        {% if result.consensus and result.consensus.candidates %}
+        <div class="card">
+          <h3>Топ кандидат</h3>
+          {% set c = result.consensus.candidates[0] %}
+          <p>HIP трійка: <b>{{ c.star_hips }}</b></p>
+          <p>Confidence: <b>{{ '%.3f'|format(c.confidence) }}</b></p>
+          <p>Avg error: <b>{{ '%.6f'|format(c.avg_error) }}</b></p>
+        </div>
+        {% endif %} {% if result.coordinate_solution %}
+        <div class="card">
+          <h3>Координатний розв'язок</h3>
+          {% if not result.trustworthy %}
+          <p class="muted-text warn">Результат недостовірний: недостатньо надійних збігів.</p>
+          {% endif %}
+          <p>
+            RA: <b>{{ '%.4f'|format(result.coordinate_solution.ra_deg) }}°</b>
+          </p>
+          <p>
+            Dec: <b>{{ '%.4f'|format(result.coordinate_solution.dec_deg) }}°</b>
+          </p>
+          {% if result.trustworthy %}
+          <p>
+            Lat: <b>{{ '%.4f'|format(result.coordinate_solution.lat_deg) }}°</b>
+          </p>
+          <p>
+            Lon: <b>{{ '%.4f'|format(result.coordinate_solution.lon_deg) }}°</b>
+          </p>
+          {% endif %}
+          <p>
+            Fit RMS:
+            <b>{{ '%.4f'|format(result.coordinate_solution.fit_rms_deg) }}°</b>
+          </p>
+          <p>
+            Fit Max:
+            <b>{{ '%.4f'|format(result.coordinate_solution.fit_max_deg) }}°</b>
+          </p>
+          {% if result.coordinate_solution.spread_deg is defined %}
+          <p>
+            Spread:
+            <b>{{ '%.4f'|format(result.coordinate_solution.spread_deg) }}°</b>
+          </p>
+          {% endif %} {% if result.coordinate_solution.used_hypotheses is
+          defined %}
+          <p>
+            Гіпотез: <b>{{ result.coordinate_solution.used_hypotheses }}</b>
+          </p>
+          {% endif %} {% if result.coordinate_solution.total_hypotheses is
+          defined %}
+          <p>
+            Всього гіпотез:
+            <b>{{ result.coordinate_solution.total_hypotheses }}</b>
+          </p>
+          {% endif %} {% if result.quality_label %}
+          <p>Якість: <b>{{ result.quality_label }}</b></p>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="card muted">
+          Координатний розв'язок не обчислено для цього кадру.
+        </div>
+        {% endif %}
+
+        <div class="images">
+          <figure>
+            <figcaption>Оригінал</figcaption>
+            <img src="{{ result.input_image }}" alt="uploaded image" />
+          </figure>
+          <figure>
+            <figcaption>Трикутники на кадрі</figcaption>
+            <img src="{{ result.preview_image }}" alt="triangles preview" />
+          </figure>
+        </div>
+      </section>
+      {% endif %}
+    </main>
+
+    <script>
+      (() => {
+        const imageInput = document.getElementById("imageInput");
+        const pasteBox = document.getElementById("pasteBox");
+        const pasteStatus = document.getElementById("pasteStatus");
+        const pastedPreview = document.getElementById("pastedPreview");
+
+        function setPastedFile(file) {
+          const dataTransfer = new DataTransfer();
+          dataTransfer.items.add(file);
+          imageInput.files = dataTransfer.files;
+
+          pasteStatus.textContent = `Вставлено: ${file.name} (${Math.round(file.size / 1024)} KB)`;
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            pastedPreview.src = e.target.result;
+            pastedPreview.hidden = false;
+          };
+          reader.readAsDataURL(file);
+        }
+
+        function readFromClipboardEvent(event) {
+          const items = event.clipboardData && event.clipboardData.items;
+          if (!items) {
+            return;
+          }
+
+          for (const item of items) {
+            if (item.type && item.type.startsWith("image/")) {
+              event.preventDefault();
+              const blob = item.getAsFile();
+              if (!blob) {
+                continue;
+              }
+              const ext = (blob.type.split("/")[1] || "png").replace(
+                "jpeg",
+                "jpg",
+              );
+              const file = new File([blob], `clipboard_${Date.now()}.${ext}`, {
+                type: blob.type,
+              });
+              setPastedFile(file);
+              return;
+            }
+          }
+        }
+
+        pasteBox.addEventListener("click", () => pasteBox.focus());
+        pasteBox.addEventListener("paste", readFromClipboardEvent);
+
+        document.addEventListener("paste", (event) => {
+          if (
+            document.activeElement === pasteBox ||
+            pasteBox.contains(document.activeElement)
+          ) {
+            readFromClipboardEvent(event);
+          }
+        });
+
+        imageInput.addEventListener("change", () => {
+          if (!imageInput.files || imageInput.files.length === 0) {
+            return;
+          }
+          const file = imageInput.files[0];
+          pasteStatus.textContent = `Обрано: ${file.name} (${Math.round(file.size / 1024)} KB)`;
+          pastedPreview.hidden = true;
+        });
+      })();
+    </script>
+  </body>
+</html>

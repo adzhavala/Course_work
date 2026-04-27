@@ -3,6 +3,7 @@ import psycopg2
 from collections import defaultdict
 from scipy.spatial import KDTree
 from config_db import DB_CONFIG
+from coordinate_transforms import ra_dec_to_cartesian
 
 
 class StarMatcher:
@@ -152,5 +153,45 @@ class StarMatcher:
 
     def close(self):
         self.conn.close()
+
+    def get_star_vectors_by_hips(self, hip_ids):
+        """Fetch RA/Dec from DB and convert to Cartesian unit vectors."""
+        if not hip_ids:
+            return {}
+
+        cursor = self.conn.cursor()
+        query = """
+            SELECT hip_id, ra, dec
+            FROM star_catalog
+            WHERE hip_id = ANY(%s)
+        """
+        cursor.execute(query, (list(hip_ids),))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        vectors = {}
+        for hip, ra_deg, dec_deg in rows:
+            vectors[int(hip)] = ra_dec_to_cartesian(float(ra_deg), float(dec_deg), radius=1.0)
+        return vectors
+
+    def get_star_magnitudes_by_hips(self, hip_ids):
+        """Fetch magnitudes by HIP id (lower magnitude is brighter)."""
+        if not hip_ids:
+            return {}
+
+        cursor = self.conn.cursor()
+        query = """
+            SELECT hip_id, magnitude
+            FROM star_catalog
+            WHERE hip_id = ANY(%s)
+        """
+        cursor.execute(query, (list(hip_ids),))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        mags = {}
+        for hip, mag in rows:
+            mags[int(hip)] = float(mag)
+        return mags
 
 
