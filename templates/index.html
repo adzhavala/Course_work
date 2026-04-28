@@ -107,13 +107,7 @@
             <input
               type="checkbox"
               name="auto_tune"
-              {%
-              if
-              form_values.auto_tune=""
-              ="on"
-              %}checked{%
-              endif
-              %}
+              {% if form_values.auto_tune == "on" %}checked{% endif %}
             />
             Автопідбір top_n / tolerance
           </label>
