@@ -87,7 +87,7 @@ def build_triangle_database():
         cos_alpha = max(-1.0, min(1.0, cos_alpha))
         min_angle = math.degrees(math.acos(cos_alpha))
 
-        if min_angle < 10.0 or max_angle > 170.0:
+        if min_angle < 15.0 or max_angle > 165.0:
             continue
 
         ratio1 = b / a

@@ -16,6 +16,7 @@ from main import (
     generate_triangles_from_stars,
 )
 from matcher import StarMatcher
+from coordinate_transforms import pixel_to_camera_ray
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -42,6 +43,8 @@ def parse_observation_time(raw_value: str):
 
     # Accept common user formats like "YYYY-MM-DD HH.MM.SS UTC+03:00".
     text = text.replace(" UTC", " ").replace("utc", " ")
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = text.replace("LMST", " ").replace("lmst", " ")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"(\d{2})\.(\d{2})\.(\d{2})(?=\s|$|[+-])", r"\1:\2:\3", text)
 
@@ -125,6 +128,14 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
     else:
         min_sep_px = 12.0
 
+    img_shape = probe_img.shape if probe_img is not None else None
+    image_rays_by_id = None
+    if img_shape is not None:
+        image_rays_by_id = {
+            star_obj.id: pixel_to_camera_ray(star_obj.center, img_shape, fov_x_deg=fov_x_deg)
+            for star_obj in stars
+        }
+
     triangles = generate_triangles_from_stars(stars, top_n=top_n, min_separation_px=min_sep_px)
     triangles_eval = triangles[:220]
 
@@ -144,7 +155,26 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
         tolerance=tolerance,
         per_triangle_k=12,
         max_fit_rms_deg=6.0,
+        img_shape=img_shape,
+        image_rays_by_id=image_rays_by_id,
+        allow_no_quad=False,
     )
+
+    if coordinate_solution is None:
+        coordinate_solution = estimate_pointing_multi_triangle(
+            star_db=star_db,
+            stars=stars,
+            image_path=str(image_path),
+            triangles=triangles_eval,
+            fov_x_deg=fov_x_deg,
+            observation_time_utc=obs_time_utc,
+            tolerance=min(0.1, tolerance * 1.8),
+            per_triangle_k=30,
+            max_fit_rms_deg=12.0,
+            img_shape=img_shape,
+            image_rays_by_id=image_rays_by_id,
+            allow_no_quad=True,
+        )
 
     if coordinate_solution is None:
         for tri in triangles_eval:
@@ -153,8 +183,8 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
                 tri["ratio2"],
                 tri["ratio3"],
                 tri["orientation"],
-                tolerance=tolerance,
-                k=1,
+                tolerance=min(0.1, tolerance * 1.6),
+                k=5,
             )
             if not matches:
                 continue
@@ -167,6 +197,8 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
                 hip_triangle=matches[0]["star_hips"],
                 fov_x_deg=fov_x_deg,
                 observation_time_utc=obs_time_utc,
+                img_shape=img_shape,
+                image_rays_by_id=image_rays_by_id,
             )
             if coordinate_solution is not None:
                 break
@@ -212,6 +244,7 @@ def index():
         "tolerance": session.get("tolerance", "0.015"),
         "observation_time_utc": session.get("observation_time_utc", ""),
         "auto_tune": session.get("auto_tune", "on"),
+        "demo_mode": session.get("demo_mode", ""),
     }
     last_image_filename = session.get("last_image_filename", "")
 
@@ -223,6 +256,7 @@ def index():
             "tolerance": (request.form.get("tolerance", "0.015") or "").strip(),
             "observation_time_utc": (request.form.get("observation_time_utc", "") or "").strip(),
             "auto_tune": "on" if request.form.get("auto_tune") else "",
+            "demo_mode": "on" if request.form.get("demo_mode") else "",
         }
 
         session.update(form_values)
@@ -231,6 +265,7 @@ def index():
         top_n = max(3, min(30, parse_int_with_default(form_values["top_n"], 8)))
         tolerance = max(0.001, min(0.1, parse_float_with_default(form_values["tolerance"], 0.015)))
         auto_tune = form_values["auto_tune"] == "on"
+        demo_mode = form_values["demo_mode"] == "on"
         obs_time_utc = parse_observation_time(form_values["observation_time_utc"])
 
         image_filename = None
@@ -335,6 +370,8 @@ def index():
                 "selected_top_n": top_n,
                 "selected_tolerance": tolerance,
                 "trustworthy": False,
+                "demo_mode": demo_mode,
+                "show_demo_coords": False,
             }
 
             if coordinate_solution is not None:
@@ -362,6 +399,8 @@ def index():
                     and hypotheses >= 3
                     and top_conf >= 0.35
                 )
+
+                result["show_demo_coords"] = result["trustworthy"] or demo_mode
 
             if len(stars) == 0:
                 error = "Зірки не знайдені. Спробуйте інше фото або параметри експозиції."

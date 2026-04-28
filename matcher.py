@@ -56,13 +56,15 @@ class StarMatcher:
         cursor.close()
 
     def find_best_match(self, img_ratio1, img_ratio2, img_ratio3, img_orientation, tolerance=0.01, k=20):
-        """Find nearest matches by ratios and orientation."""
+        """Find nearest matches by ratios and orientation using fixed-radius search."""
 
         if self.tree is None:
             return []
 
         query_pt = [img_ratio1, img_ratio2, img_ratio3, img_orientation]
-        distances, indices = self.tree.query(query_pt, k=k)
+        # Use query_ball_point (Chebyshev distance p=np.inf) to find ALL candidates 
+        # within the tolerance box, ignoring arbitrary 'k' limits which fail on dense fields.
+        indices = self.tree.query_ball_point(query_pt, r=tolerance, p=np.inf)
 
         valid_matches = []
 
@@ -74,18 +76,23 @@ class StarMatcher:
             dorient = 0 if orient == 0 or img_orientation == 0 else abs(orient - img_orientation)
             return dr1 + dr2 + dr3 + 2.0 * dorient
 
-        for dist, idx in zip(np.atleast_1d(distances), np.atleast_1d(indices)):
+        for idx in indices:
             if idx >= len(self.triangles_data):
                 continue
             hip1, hip2, hip3, orient = self.triangles_data[idx]
             feature_vec = self.tree.data[idx]
-            if score(feature_vec) <= tolerance:
+            err = score(feature_vec)
+            if err <= tolerance:
                 valid_matches.append({
                     'star_hips': (hip1, hip2, hip3),
-                    'error': score(feature_vec)
+                    'error': err
                 })
 
-        return valid_matches
+        # Sort matches by error so best ones are first, just like k-nearest did
+        valid_matches.sort(key=lambda m: m['error'])
+        
+        # Optional: still limit upper bound to extremely high numbers to prevent RAM flood
+        return valid_matches[:200]
 
     def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20):
         """Aggregate matches from multiple triangles into confidence scores."""

@@ -164,7 +164,7 @@ def calculate_distance(p1, p2):
 
 def orientation_sign_2d(p1, p2, p3):
     cross = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
-    if cross == 0:
+    if abs(cross) < 1e-9:
         return 0.0
     return 1.0 if cross > 0 else -1.0
 
@@ -217,11 +217,17 @@ def estimate_pointing_and_earth_coordinates(
     hip_triangle,
     fov_x_deg=60.0,
     observation_time_utc=None,
+    img_shape=None,
+    image_rays_by_id=None,
 ):
     """Estimate camera pointing in celestial frame and map it to Earth coordinates."""
-    img = cv2.imread(image_path)
-    if img is None:
-        return None
+    if img_shape is None:
+        if not image_path:
+            return None
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        img_shape = img.shape
 
     star_by_id = {s.id: s for s in stars}
     if len(image_triangle) != 3 or len(hip_triangle) != 3:
@@ -233,7 +239,14 @@ def estimate_pointing_and_earth_coordinates(
         star_obj = star_by_id.get(img_star_id)
         if star_obj is None:
             return None
-        image_rays.append(pixel_to_camera_ray(star_obj.center, img.shape, fov_x_deg=fov_x_deg))
+        if image_rays_by_id is not None:
+            ray = image_rays_by_id.get(img_star_id)
+            if ray is None:
+                ray = pixel_to_camera_ray(star_obj.center, img_shape, fov_x_deg=fov_x_deg)
+                image_rays_by_id[img_star_id] = ray
+            image_rays.append(ray)
+        else:
+            image_rays.append(pixel_to_camera_ray(star_obj.center, img_shape, fov_x_deg=fov_x_deg))
 
     image_brightness = [star_by_id[sid].brightness for sid in image_star_ids]
     observed_pair_angles = _triangle_pair_angles_deg(image_rays)
@@ -309,7 +322,13 @@ def estimate_pointing_and_earth_coordinates(
     quad_support_angles = []
     quad_support_count = 0
     for star_obj in remaining_stars:
-        star_ray = pixel_to_camera_ray(star_obj.center, img.shape, fov_x_deg=fov_x_deg)
+        if image_rays_by_id is not None:
+            star_ray = image_rays_by_id.get(star_obj.id)
+            if star_ray is None:
+                star_ray = pixel_to_camera_ray(star_obj.center, img_shape, fov_x_deg=fov_x_deg)
+                image_rays_by_id[star_obj.id] = star_ray
+        else:
+            star_ray = pixel_to_camera_ray(star_obj.center, img_shape, fov_x_deg=fov_x_deg)
         star_eci = r_ci.T @ star_ray
         star_eci = star_eci / np.linalg.norm(star_eci)
         _, best_angle = star_db.find_nearest_catalog_star(star_eci, excluded_hips=excluded_hips)
@@ -380,9 +399,27 @@ def estimate_pointing_multi_triangle(
     tolerance=0.015,
     per_triangle_k=3,
     max_fit_rms_deg=5.0,
+    img_shape=None,
+    image_rays_by_id=None,
+    allow_no_quad=False,
 ):
     """Aggregate multiple triangle hypotheses into one robust coordinate estimate."""
     hypotheses = []
+
+    if img_shape is None or image_rays_by_id is None:
+        if not image_path:
+            return None
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        img_shape = img.shape
+        image_rays_by_id = {}
+        for star_obj in stars:
+            image_rays_by_id[star_obj.id] = pixel_to_camera_ray(
+                star_obj.center,
+                img_shape,
+                fov_x_deg=fov_x_deg,
+            )
 
     for t in triangles:
         matches = star_db.find_best_match(
@@ -405,6 +442,8 @@ def estimate_pointing_multi_triangle(
                 hip_triangle=m['star_hips'],
                 fov_x_deg=fov_x_deg,
                 observation_time_utc=observation_time_utc,
+                img_shape=img_shape,
+                image_rays_by_id=image_rays_by_id,
             )
             if sol is None:
                 continue
@@ -412,7 +451,7 @@ def estimate_pointing_multi_triangle(
                 continue
             if float(sol.get('triangle_pair_rms_deg', sol['fit_rms_deg'])) > 1.2:
                 continue
-            if len(stars) >= 6 and int(sol.get('quad_support_count', 0)) == 0:
+            if not allow_no_quad and len(stars) >= 6 and int(sol.get('quad_support_count', 0)) == 0:
                 continue
 
             hypotheses.append({
@@ -540,7 +579,8 @@ def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0):
         cos_alpha = max(-1.0, min(1.0, cos_alpha))
         min_angle = math.degrees(math.acos(cos_alpha))
 
-        if min_angle < 10.0 or max_angle > 170.0:
+        # Tightened constraints: highly collinear or needle-like triangles are too ambiguous in dense fields.
+        if min_angle < 15.0 or max_angle > 165.0:
             continue
 
         ratio1 = b / a
