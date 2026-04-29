@@ -63,7 +63,7 @@ def parse_observation_time(raw_value: str):
         return None
 
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        return None
     return dt.astimezone(timezone.utc)
 
 
@@ -117,7 +117,7 @@ def parse_int_with_default(raw_value: str, default: int) -> int:
         return default
 
 
-def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance):
+def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance, orientation_sign):
     probe_img = cv2.imread(str(image_path))
     if probe_img is not None:
         img_h, img_w = probe_img.shape[:2]
@@ -125,7 +125,12 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
     else:
         min_sep_px = 12.0
 
-    triangles = generate_triangles_from_stars(stars, top_n=top_n, min_separation_px=min_sep_px)
+    triangles = generate_triangles_from_stars(
+        stars,
+        top_n=top_n,
+        min_separation_px=min_sep_px,
+        orientation_sign=orientation_sign,
+    )
     triangles_eval = triangles[:220]
 
     consensus = star_db.find_consensus_matches(
@@ -207,6 +212,7 @@ def index():
         "top_n": session.get("top_n", "8"),
         "tolerance": session.get("tolerance", "0.015"),
         "observation_time_utc": session.get("observation_time_utc", ""),
+        "invert_orientation": session.get("invert_orientation", ""),
         "auto_tune": session.get("auto_tune", "on"),
     }
     last_image_filename = session.get("last_image_filename", "")
@@ -218,6 +224,7 @@ def index():
             "top_n": (request.form.get("top_n", "8") or "").strip(),
             "tolerance": (request.form.get("tolerance", "0.015") or "").strip(),
             "observation_time_utc": (request.form.get("observation_time_utc", "") or "").strip(),
+            "invert_orientation": "on" if request.form.get("invert_orientation") else "",
             "auto_tune": "on" if request.form.get("auto_tune") else "",
         }
 
@@ -228,6 +235,27 @@ def index():
         tolerance = max(0.001, min(0.1, parse_float_with_default(form_values["tolerance"], 0.015)))
         auto_tune = form_values["auto_tune"] == "on"
         obs_time_utc = parse_observation_time(form_values["observation_time_utc"])
+        invert_orientation = form_values["invert_orientation"] == "on"
+        orientation_sign = -1.0 if invert_orientation else 1.0
+
+        if not form_values["observation_time_utc"]:
+            error = "Вкажіть час знімка та UTC-офсет (напр. 2026-04-26 21:15:00 +03:00)."
+            return render_template(
+                "index.html",
+                result=result,
+                error=error,
+                form_values=form_values,
+                last_image_filename=last_image_filename,
+            )
+        if obs_time_utc is None:
+            error = "Невірний формат часу або відсутній UTC-офсет (напр. +03:00)."
+            return render_template(
+                "index.html",
+                result=result,
+                error=error,
+                form_values=form_values,
+                last_image_filename=last_image_filename,
+            )
 
         image_filename = None
         image_path = None
@@ -279,11 +307,12 @@ def index():
                 obs_time_utc=obs_time_utc,
                 top_n=top_n,
                 tolerance=tolerance,
+                orientation_sign=orientation_sign,
             )
 
             if auto_tune:
                 top_candidates = sorted({max(6, min(24, t)) for t in [top_n - 4, top_n - 2, top_n, top_n + 2, top_n + 4, top_n + 8, top_n + 12]})
-                tol_candidates = sorted({max(0.006, min(0.04, v)) for v in [tolerance * 0.60, tolerance * 0.80, tolerance, tolerance * 1.20, tolerance * 1.50, tolerance * 1.80]})
+                tol_candidates = sorted({max(0.006, min(0.06, v)) for v in [tolerance * 0.60, tolerance * 0.80, tolerance, tolerance * 1.20, tolerance * 1.50, tolerance * 1.80, tolerance * 2.20]})
 
                 for tn in top_candidates:
                     for tol in tol_candidates:
@@ -295,6 +324,7 @@ def index():
                             obs_time_utc=obs_time_utc,
                             top_n=tn,
                             tolerance=tol,
+                            orientation_sign=orientation_sign,
                         )
                         if candidate["score"] < best_eval["score"]:
                             best_eval = candidate
@@ -314,6 +344,13 @@ def index():
             preview_path = UPLOAD_DIR / preview_filename
             draw_triangles_preview(image_path, stars, triangles, preview_path)
 
+            top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
+            top_support = consensus["candidates"][0]["support_count"] if consensus["candidates"] else 0
+
+            if coordinate_solution is None or top_conf < 0.35 or top_support < 3:
+                coordinate_solution = None
+                error = "Розв'язок не знайдено (недостатня підтримка або низька впевненість)."
+
             result = {
                 "input_image": url_for("uploaded_file", filename=image_filename),
                 "preview_image": url_for("uploaded_file", filename=preview_filename),
@@ -322,9 +359,7 @@ def index():
                 "consensus": consensus,
                 "coordinate_solution": coordinate_solution,
                 "fov_x_deg": fov_x_deg,
-                "observation_time_utc": (
-                    obs_time_utc.isoformat() if obs_time_utc is not None else "Auto (current UTC)"
-                ),
+                "observation_time_utc": obs_time_utc.isoformat(),
                 "image_filename": image_filename,
                 "quality_label": None,
                 "auto_tuned": auto_tune,
@@ -359,8 +394,6 @@ def index():
                 error = "Зірки не знайдені. Спробуйте інше фото або параметри експозиції."
             elif len(triangles) == 0:
                 error = "Трикутники не згенеровані. Спробуйте збільшити top_n."
-            elif not consensus["candidates"]:
-                error = "Збіги в каталозі не знайдено для цього кадру."
 
         except Exception as exc:
             error = f"Помилка обробки: {exc}"

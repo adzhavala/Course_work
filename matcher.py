@@ -87,7 +87,7 @@ class StarMatcher:
 
         return valid_matches
 
-    def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20):
+    def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20, min_support=3):
         """Aggregate matches from multiple triangles into confidence scores."""
 
         if not triangles:
@@ -130,6 +130,8 @@ class StarMatcher:
 
         for hips_key, stats in aggregate.items():
             count = stats['count']
+            if count < min_support:
+                continue
             avg_error = stats['error_sum'] / count
             support_ratio = count / used_triangles if used_triangles else 0.0
             error_quality = 1.0 / (1.0 + 100.0 * avg_error)

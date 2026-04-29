@@ -137,9 +137,9 @@ def greenwich_sidereal_time_deg(dt_utc: datetime) -> float:
     return gmst % 360.0
 
 
-def eci_to_ecef(v_eci: Sequence[float], dt_utc: datetime) -> np.ndarray:
+def eci_to_ecef(v_eci: Sequence[float], dt_utc: datetime, rotation_sign: float = 1.0) -> np.ndarray:
     """Rotate vector from Earth-centered inertial frame to Earth-fixed frame."""
-    theta = math.radians(greenwich_sidereal_time_deg(dt_utc))
+    theta = rotation_sign * math.radians(greenwich_sidereal_time_deg(dt_utc))
     c = math.cos(theta)
     s = math.sin(theta)
     rot = np.array(

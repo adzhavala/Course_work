@@ -28,11 +28,11 @@ class Star:
 
 def find_stars_advanced(
     path,
-    threshold_factor=2.5,
-    min_area=2,
-    max_area=500,
+    threshold_factor=4.0,
+    min_area=8,
+    max_area=10000,
     border_exclusion_frac=0.02,
-    min_circularity=0.10,
+    min_circularity=0.5,
     max_axis_ratio=5.0,
 ):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -132,24 +132,30 @@ def find_stars_advanced(
 
         _, max_val, _, _ = cv2.minMaxLoc(img, mask=star_mask)
 
+        raw_brightness = float(max_val)
+        raw_flux = raw_brightness * float(area)
+
         stars_data.append({
             "id": i,
             "center": (cx, cy),
             "radius": max_radius,
-            "raw_brightness": float(max_val)
+            "area": int(area),
+            "raw_brightness": raw_brightness,
+            "raw_flux": raw_flux,
         })
 
     if not stars_data:
         return []
 
-    all_brights = [s["raw_brightness"] for s in stars_data]
-    min_b = min(all_brights)
-    max_b = max(all_brights)
+    stars_data.sort(key=lambda s: s["raw_flux"], reverse=True)
+    all_flux = [s["raw_flux"] for s in stars_data]
+    min_b = min(all_flux)
+    max_b = max(all_flux)
 
     final_stars = []
     for s in stars_data:
         if max_b - min_b > 0:
-            norm_b = (s["raw_brightness"] - min_b) / (max_b - min_b)
+            norm_b = (s["raw_flux"] - min_b) / (max_b - min_b)
         else:
             norm_b = 1.0
 
@@ -480,7 +486,7 @@ def estimate_pointing_multi_triangle(
     }
 
 
-def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0):
+def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0, orientation_sign=1.0):
     brightest_stars = select_spread_bright_stars(stars, top_n=top_n, min_separation_px=min_separation_px)
 
     triangles_data = []
@@ -512,7 +518,7 @@ def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0):
         ratio1 = b / a
         ratio2 = c / a
         ratio3 = b / c if c > 0 else 0.0
-        orientation = orientation_sign_2d(s1.center, s2.center, s3.center)
+        orientation = orientation_sign * orientation_sign_2d(s1.center, s2.center, s3.center)
 
         triangle_id = f"tri_{s1.id}_{s2.id}_{s3.id}"
 

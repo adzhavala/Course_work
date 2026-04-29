@@ -94,13 +94,22 @@
           </label>
 
           <label>
-            UTC час спостереження (ISO, опціонально)
+            Час знімка + UTC-офсет
             <input
               type="text"
               name="observation_time_utc"
               value="{{ form_values.observation_time_utc }}"
-              placeholder="2026-04-26T21:15:00+00:00"
+              placeholder="2026-04-26 21:15:00 +03:00"
             />
+          </label>
+
+          <label class="checkbox-line">
+            <input
+              type="checkbox"
+              name="invert_orientation"
+              {% if form_values.invert_orientation == "on" %}checked{% endif %}
+            />
+            Дзеркальний/інверсний скрін (поміняти знак орієнтації)
           </label>
 
           <label class="checkbox-line">
@@ -156,25 +165,18 @@
         {% endif %} {% if result.coordinate_solution %}
         <div class="card">
           <h3>Координатний розв'язок</h3>
-          {% if not result.trustworthy %}
-          <p class="muted-text warn">
-            Результат недостовірний: недостатньо надійних збігів.
-          </p>
-          {% endif %}
           <p>
             RA: <b>{{ '%.4f'|format(result.coordinate_solution.ra_deg) }}°</b>
           </p>
           <p>
             Dec: <b>{{ '%.4f'|format(result.coordinate_solution.dec_deg) }}°</b>
           </p>
-          {% if result.trustworthy %}
           <p>
             Lat: <b>{{ '%.4f'|format(result.coordinate_solution.lat_deg) }}°</b>
           </p>
           <p>
             Lon: <b>{{ '%.4f'|format(result.coordinate_solution.lon_deg) }}°</b>
           </p>
-          {% endif %}
           <p>
             Fit RMS:
             <b>{{ '%.4f'|format(result.coordinate_solution.fit_rms_deg) }}°</b>
