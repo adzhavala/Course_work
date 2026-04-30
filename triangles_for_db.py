@@ -22,7 +22,15 @@ def angular_distance(ra1_deg, dec1_deg, ra2_deg, dec2_deg):
     return math.degrees(math.acos(term))
 
 
-def build_triangle_database():
+def build_triangle_database(
+    max_stars=1500,
+    max_magnitude=4.5,
+    min_side_deg=0.5,
+    max_side_deg=50.0,
+    min_angle_deg=10.0,
+    max_angle_deg=170.0,
+    insert_batch_size=5000,
+):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
     except psycopg2.OperationalError as e:
@@ -37,7 +45,16 @@ def build_triangle_database():
         cursor.execute("TRUNCATE TABLE star_triangles RESTART IDENTITY;")
 
         print("Fetching stars from database...")
-        cursor.execute("SELECT hip_id, ra, dec FROM star_catalog ORDER BY magnitude ASC LIMIT 200;")
+        cursor.execute(
+            """
+            SELECT hip_id, ra, dec
+            FROM star_catalog
+            WHERE magnitude <= %s
+            ORDER BY magnitude ASC
+            LIMIT %s;
+            """,
+            (max_magnitude, max_stars),
+        )
         stars = cursor.fetchall()
         print(f"Retrieved {len(stars)} brightest stars.")
 
@@ -58,9 +75,11 @@ def build_triangle_database():
         conn.close()
         return
 
-    triangles_to_insert = []
     total_combinations = math.comb(len(stars), 3)
     print(f"Processing {total_combinations} combinations (this will take a few seconds)...")
+
+    inserted_count = 0
+    batch = []
 
     for i, combo in enumerate(combinations(stars, 3)):
         if i % 200000 == 0 and i > 0:
@@ -76,7 +95,7 @@ def build_triangle_database():
         sides = sorted([d1, d2, d3])
         a, b, c = sides[0], sides[1], sides[2]
 
-        if a < 0.5 or c > 20.0:
+        if a < min_side_deg or c > max_side_deg:
             continue
 
         cos_gamma = (a**2 + b**2 - c**2) / (2 * a * b)
@@ -87,7 +106,7 @@ def build_triangle_database():
         cos_alpha = max(-1.0, min(1.0, cos_alpha))
         min_angle = math.degrees(math.acos(cos_alpha))
 
-        if min_angle < 10.0 or max_angle > 170.0:
+        if min_angle < min_angle_deg or max_angle > max_angle_deg:
             continue
 
         ratio1 = b / a
@@ -100,34 +119,65 @@ def build_triangle_database():
         p3 = (s3[1] * math.cos(dec_mean), s3[2])
         orient = orientation_sign(p1, p2, p3)
 
-        triangles_to_insert.append((s1[0], s2[0], s3[0], ratio1, ratio2, ratio3, orient, c))
+        batch.append((s1[0], s2[0], s3[0], ratio1, ratio2, ratio3, orient, c))
 
-    print(f"Generation complete! Selected {len(triangles_to_insert)} ideal triangles for database.")
-    print("Writing to database...")
+        if len(batch) >= insert_batch_size:
+            try:
+                try:
+                    insert_query = """
+                        INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, orientation, max_side_deg)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.executemany(insert_query, batch)
+                except Exception:
+                    insert_query_legacy = """
+                        INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, max_side_deg)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """
+                    legacy_payload = [(t[0], t[1], t[2], t[3], t[4], t[-1]) for t in batch]
+                    cursor.executemany(insert_query_legacy, legacy_payload)
 
-    try:
+                conn.commit()
+                inserted_count += len(batch)
+                batch.clear()
+            except Exception as e:
+                print(f"Write error: {e}")
+                conn.rollback()
+                cursor.close()
+                conn.close()
+                return
+
+    if batch:
         try:
-            insert_query = """
-                INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, orientation, max_side_deg)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            cursor.executemany(insert_query, triangles_to_insert)
-        except Exception:
-            insert_query_legacy = """
-                INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, max_side_deg)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            legacy_payload = [(t[0], t[1], t[2], t[3], t[4], t[-1]) for t in triangles_to_insert]
-            cursor.executemany(insert_query_legacy, legacy_payload)
+            try:
+                insert_query = """
+                    INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, orientation, max_side_deg)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.executemany(insert_query, batch)
+            except Exception:
+                insert_query_legacy = """
+                    INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, max_side_deg)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                legacy_payload = [(t[0], t[1], t[2], t[3], t[4], t[-1]) for t in batch]
+                cursor.executemany(insert_query_legacy, legacy_payload)
 
-        conn.commit()
-        print(f"Success! Triangle database updated ({len(triangles_to_insert)} records).")
-    except Exception as e:
-        print(f"Write error: {e}")
-        conn.rollback()
-    finally:
-        cursor.close()
-        conn.close()
+            conn.commit()
+            inserted_count += len(batch)
+            batch.clear()
+        except Exception as e:
+            print(f"Write error: {e}")
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            return
+
+    print(f"Generation complete! Selected {inserted_count} ideal triangles for database.")
+    print("Triangle database updated.")
+
+    cursor.close()
+    conn.close()
 
 
 if __name__ == "__main__":

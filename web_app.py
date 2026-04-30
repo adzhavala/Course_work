@@ -200,7 +200,39 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
         "top_n": top_n,
         "tolerance": tolerance,
         "score": score,
+        "orientation_sign": orientation_sign,
     }
+
+
+def pick_best_orientation(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance):
+    eval_pos = evaluate_config(
+        star_db=star_db,
+        stars=stars,
+        image_path=image_path,
+        fov_x_deg=fov_x_deg,
+        obs_time_utc=obs_time_utc,
+        top_n=top_n,
+        tolerance=tolerance,
+        orientation_sign=1.0,
+    )
+    eval_neg = evaluate_config(
+        star_db=star_db,
+        stars=stars,
+        image_path=image_path,
+        fov_x_deg=fov_x_deg,
+        obs_time_utc=obs_time_utc,
+        top_n=top_n,
+        tolerance=tolerance,
+        orientation_sign=-1.0,
+    )
+
+    def rank_key(e):
+        candidates = e["consensus"]["candidates"]
+        top_conf = candidates[0]["confidence"] if candidates else 0.0
+        top_support = candidates[0]["support_count"] if candidates else 0
+        return (top_support, top_conf, -e["score"])
+
+    return eval_pos if rank_key(eval_pos) >= rank_key(eval_neg) else eval_neg
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -212,7 +244,6 @@ def index():
         "top_n": session.get("top_n", "8"),
         "tolerance": session.get("tolerance", "0.015"),
         "observation_time_utc": session.get("observation_time_utc", ""),
-        "invert_orientation": session.get("invert_orientation", ""),
         "auto_tune": session.get("auto_tune", "on"),
     }
     last_image_filename = session.get("last_image_filename", "")
@@ -224,7 +255,6 @@ def index():
             "top_n": (request.form.get("top_n", "8") or "").strip(),
             "tolerance": (request.form.get("tolerance", "0.015") or "").strip(),
             "observation_time_utc": (request.form.get("observation_time_utc", "") or "").strip(),
-            "invert_orientation": "on" if request.form.get("invert_orientation") else "",
             "auto_tune": "on" if request.form.get("auto_tune") else "",
         }
 
@@ -235,8 +265,6 @@ def index():
         tolerance = max(0.001, min(0.1, parse_float_with_default(form_values["tolerance"], 0.015)))
         auto_tune = form_values["auto_tune"] == "on"
         obs_time_utc = parse_observation_time(form_values["observation_time_utc"])
-        invert_orientation = form_values["invert_orientation"] == "on"
-        orientation_sign = -1.0 if invert_orientation else 1.0
 
         if not form_values["observation_time_utc"]:
             error = "Вкажіть час знімка та UTC-офсет (напр. 2026-04-26 21:15:00 +03:00)."
@@ -299,7 +327,7 @@ def index():
 
             star_db = StarMatcher(db_config=DB_CONFIG)
 
-            best_eval = evaluate_config(
+            best_eval = pick_best_orientation(
                 star_db=star_db,
                 stars=stars,
                 image_path=image_path,
@@ -307,7 +335,6 @@ def index():
                 obs_time_utc=obs_time_utc,
                 top_n=top_n,
                 tolerance=tolerance,
-                orientation_sign=orientation_sign,
             )
 
             if auto_tune:
@@ -316,7 +343,7 @@ def index():
 
                 for tn in top_candidates:
                     for tol in tol_candidates:
-                        candidate = evaluate_config(
+                        candidate = pick_best_orientation(
                             star_db=star_db,
                             stars=stars,
                             image_path=image_path,
@@ -324,7 +351,6 @@ def index():
                             obs_time_utc=obs_time_utc,
                             top_n=tn,
                             tolerance=tol,
-                            orientation_sign=orientation_sign,
                         )
                         if candidate["score"] < best_eval["score"]:
                             best_eval = candidate
