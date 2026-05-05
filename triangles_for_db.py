@@ -4,10 +4,6 @@ from itertools import combinations
 from config_db import DB_CONFIG
 
 
-def orientation_sign(p1, p2, p3):
-    return math.copysign(1.0, (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0]))
-
-
 def angular_distance(ra1_deg, dec1_deg, ra2_deg, dec2_deg):
     ra1_rad = math.radians(ra1_deg)
     ra2_rad = math.radians(ra2_deg)
@@ -113,29 +109,19 @@ def build_triangle_database(
         ratio2 = c / a
         ratio3 = b / c
 
-        dec_mean = math.radians((s1[2] + s2[2] + s3[2]) / 3.0)
-        p1 = (s1[1] * math.cos(dec_mean), s1[2])
-        p2 = (s2[1] * math.cos(dec_mean), s2[2])
-        p3 = (s3[1] * math.cos(dec_mean), s3[2])
-        orient = orientation_sign(p1, p2, p3)
-
-        batch.append((s1[0], s2[0], s3[0], ratio1, ratio2, ratio3, orient, c))
+        # Orientation has been removed from the feature vector to prevent
+        # incompatibility between catalog (sph) and image (pixel) orientation conventions.
+        # KD-Tree now uses only 3D ratio features.
+        batch.append((s1[0], s2[0], s3[0], ratio1, ratio2, ratio3, c))
 
         if len(batch) >= insert_batch_size:
             try:
-                try:
-                    insert_query = """
-                        INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, orientation, max_side_deg)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """
-                    cursor.executemany(insert_query, batch)
-                except Exception:
-                    insert_query_legacy = """
-                        INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, max_side_deg)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """
-                    legacy_payload = [(t[0], t[1], t[2], t[3], t[4], t[-1]) for t in batch]
-                    cursor.executemany(insert_query_legacy, legacy_payload)
+                # Insert batch: 7 fields (no orientation)
+                insert_query = """
+                    INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, max_side_deg)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.executemany(insert_query, batch)
 
                 conn.commit()
                 inserted_count += len(batch)
@@ -149,19 +135,12 @@ def build_triangle_database(
 
     if batch:
         try:
-            try:
-                insert_query = """
-                    INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, orientation, max_side_deg)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                cursor.executemany(insert_query, batch)
-            except Exception:
-                insert_query_legacy = """
-                    INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, max_side_deg)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """
-                legacy_payload = [(t[0], t[1], t[2], t[3], t[4], t[-1]) for t in batch]
-                cursor.executemany(insert_query_legacy, legacy_payload)
+            # Insert remaining batch: 7 fields (no orientation)
+            insert_query = """
+                INSERT INTO star_triangles (star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, max_side_deg)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.executemany(insert_query, batch)
 
             conn.commit()
             inserted_count += len(batch)

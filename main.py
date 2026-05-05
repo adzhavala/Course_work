@@ -4,15 +4,19 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 from itertools import permutations
-from collections import Counter
+from collections import Counter, defaultdict
 from coordinate_transforms import (
-    angular_residuals_deg,
     cartesian_to_ra_dec,
     ecef_to_lat_lon_deg,
-    estimate_rotation_kabsch,
     eci_to_ecef,
+    normalize_vector,
     pixel_to_camera_ray,
+    solve_vector_from_angular_constraints,
 )
+
+PAIR_RMS_GATE_DEG = 3.0
+RANK_MISMATCH_WEIGHT = 0.05
+FOV_DIAG_MARGIN = 1.1
 
 
 class Star:
@@ -168,13 +172,6 @@ def calculate_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
 
-def orientation_sign_2d(p1, p2, p3):
-    cross = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
-    if cross == 0:
-        return 0.0
-    return 1.0 if cross > 0 else -1.0
-
-
 def select_spread_bright_stars(stars, top_n=10, min_separation_px=16.0):
     """Greedy bright-star selection with minimum spacing to reduce near-duplicate picks."""
     sorted_by_brightness = sorted(stars, key=lambda s: s.brightness, reverse=True)
@@ -215,6 +212,22 @@ def alpha_from_pixel(center_xy, image_shape, fov_x_deg=60.0):
     return math.degrees(math.atan2(radial_px, f))
 
 
+def fov_diag_limit_deg(fov_x_deg, image_shape, margin=FOV_DIAG_MARGIN):
+    """Compute a diagonal FOV limit for triangle filtering from image shape."""
+    if image_shape is None:
+        return fov_x_deg * 1.6
+
+    height, width = image_shape[:2]
+    if width <= 0 or height <= 0 or fov_x_deg <= 0.0 or fov_x_deg >= 179.0:
+        return fov_x_deg * 1.6
+
+    tan_x = math.tan(math.radians(fov_x_deg / 2.0))
+    tan_y = tan_x * (height / width)
+    tan_diag = math.hypot(tan_x, tan_y)
+    fov_diag_deg = math.degrees(2.0 * math.atan(tan_diag))
+    return fov_diag_deg * margin
+
+
 def estimate_pointing_and_earth_coordinates(
     star_db,
     stars,
@@ -223,8 +236,15 @@ def estimate_pointing_and_earth_coordinates(
     hip_triangle,
     fov_x_deg=60.0,
     observation_time_utc=None,
+    force=False,
+    pair_rms_gate_deg=PAIR_RMS_GATE_DEG,
 ):
-    """Estimate camera pointing in celestial frame and map it to Earth coordinates."""
+    """Estimate optical axis in ECI via intersection of position circles.
+
+    The solver uses angular distances from the optical axis (image center) to each
+    matched star. Mapping the resulting optical axis to Earth yields the observer's
+    location ONLY if the camera was pointing at the local zenith.
+    """
     img = cv2.imread(image_path)
     if img is None:
         return None
@@ -234,20 +254,27 @@ def estimate_pointing_and_earth_coordinates(
         return None
 
     image_star_ids = list(image_triangle)
+    alphas_deg = []
+    image_brightness = []
     image_rays = []
     for img_star_id in image_star_ids:
         star_obj = star_by_id.get(img_star_id)
         if star_obj is None:
             return None
+        alphas_deg.append(alpha_from_pixel(star_obj.center, img.shape, fov_x_deg=fov_x_deg))
+        image_brightness.append(star_obj.brightness)
         image_rays.append(pixel_to_camera_ray(star_obj.center, img.shape, fov_x_deg=fov_x_deg))
-
-    image_brightness = [star_by_id[sid].brightness for sid in image_star_ids]
-    observed_pair_angles = _triangle_pair_angles_deg(image_rays)
 
     hip_ids = [int(h) for h in hip_triangle]
     vectors_map = star_db.get_star_vectors_by_hips(hip_ids)
     mags_map = star_db.get_star_magnitudes_by_hips(hip_ids)
     if len(vectors_map) != len(hip_ids):
+        return None
+
+    # Strict angular consistency gate: reject catalog triangles with mismatched side angles.
+    base_star_vectors = [vectors_map[hip] for hip in hip_ids]
+    pair_rms_deg = _triangle_pair_rms_deg(image_rays, base_star_vectors)
+    if pair_rms_deg > pair_rms_gate_deg and not force:
         return None
 
     # Triangle features are permutation-invariant, so resolve correspondence explicitly.
@@ -257,10 +284,6 @@ def estimate_pointing_and_earth_coordinates(
 
     for perm in permutations(hip_ids):
         star_vectors = [vectors_map[hip] for hip in perm]
-        pair_rms_deg = _triangle_pair_rms_deg(image_rays, star_vectors)
-        if pair_rms_deg > 1.6:
-            # Reject catalog triangles that do not preserve observed angular scale.
-            continue
 
         if len(mags_map) == len(hip_ids):
             mags = [mags_map[hip] for hip in perm]
@@ -270,33 +293,43 @@ def estimate_pointing_and_earth_coordinates(
             rank_mismatch = 0
 
         try:
-            r_ci = estimate_rotation_kabsch(star_vectors, image_rays)
-            residuals_deg = angular_residuals_deg(star_vectors, image_rays, r_ci)
-            rms_deg = float(np.sqrt(np.mean(np.square(residuals_deg))))
+            r_eci, residuals = solve_vector_from_angular_constraints(star_vectors, alphas_deg, radius=1.0)
         except Exception:
             continue
 
-        # Composite score: fit + pair-angle consistency + brightness-order consistency.
-        score = rms_deg + 0.8 * pair_rms_deg + 0.35 * rank_mismatch
+        residuals = np.asarray(residuals, dtype=np.float64)
+        residual_rms = float(np.sqrt(np.mean(np.square(residuals))))
+        residual_max = float(np.max(np.abs(residuals)))
+
+        # Angular residuals for reporting (degrees).
+        ang_residuals = []
+        for vec, alpha_obs in zip(star_vectors, alphas_deg):
+            cos_alpha = float(np.dot(normalize_vector(vec), normalize_vector(r_eci)))
+            cos_alpha = max(-1.0, min(1.0, cos_alpha))
+            alpha_hat = math.degrees(math.acos(cos_alpha))
+            ang_residuals.append(alpha_hat - alpha_obs)
+        ang_residuals = np.asarray(ang_residuals, dtype=np.float64)
+        angle_rms_deg = float(np.sqrt(np.mean(np.square(ang_residuals))))
+        angle_max_deg = float(np.max(np.abs(ang_residuals)))
+
+        # Composite score: angular fit + pairwise consistency + weak brightness tie-breaker.
+        score = angle_rms_deg + 0.5 * pair_rms_deg + RANK_MISMATCH_WEIGHT * rank_mismatch
 
         if best is None or score < best['score']:
             best = {
                 'perm': perm,
-                'rotation': r_ci,
-                'residuals_deg': residuals_deg,
-                'rms_deg': rms_deg,
-                'pair_rms_deg': pair_rms_deg,
+                'r_eci': r_eci,
+                'residual_rms': residual_rms,
+                'residual_max': residual_max,
+                'angle_rms_deg': angle_rms_deg,
+                'angle_max_deg': angle_max_deg,
                 'score': score,
             }
 
     if best is None:
         return None
 
-    r_ci = best['rotation']
-    # Optical axis in camera frame is +Z, convert to inertial using inverse rotation.
-    optical_axis_camera = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    r_eci = r_ci.T @ optical_axis_camera
-    r_eci = r_eci / np.linalg.norm(r_eci)
+    r_eci = normalize_vector(best['r_eci'], radius=1.0)
 
     ra_deg, dec_deg = cartesian_to_ra_dec(r_eci)
 
@@ -306,20 +339,25 @@ def estimate_pointing_and_earth_coordinates(
     else:
         now_utc = now_utc.astimezone(timezone.utc)
     r_ecef = eci_to_ecef(r_eci, now_utc)
-    lat_deg, lon_deg = ecef_to_lat_lon_deg(r_ecef)
+    pointing_lat_deg, pointing_lon_deg = ecef_to_lat_lon_deg(r_ecef)
 
     return {
         'ra_deg': ra_deg,
         'dec_deg': dec_deg,
-        'lat_deg': lat_deg,
-        'lon_deg': lon_deg,
+        'lat_deg': pointing_lat_deg,
+        'lon_deg': pointing_lon_deg,
+        'pointing_lat_deg': pointing_lat_deg,
+        'pointing_lon_deg': pointing_lon_deg,
         'r_eci': r_eci,
-        'fit_rms_deg': best['rms_deg'],
-        'fit_max_deg': float(np.max(best['residuals_deg'])),
-        'triangle_pair_rms_deg': best['pair_rms_deg'],
+        'fit_rms_deg': best['angle_rms_deg'],
+        'fit_max_deg': best['angle_max_deg'],
+        'residual_rms': best['residual_rms'],
+        'residual_max': best['residual_max'],
+        'triangle_pair_rms_deg': pair_rms_deg,
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': tuple(best['perm']),
-        'observed_pair_angles_deg': observed_pair_angles.tolist(),
+        'matched_hips': tuple(best['perm']),
+        'image_star_ids': tuple(image_star_ids),
     }
 
 
@@ -347,9 +385,12 @@ def _triangle_pair_angles_deg(vectors):
 
 
 def _triangle_pair_rms_deg(vectors_a, vectors_b):
-    """RMS mismatch between pairwise angular distances of two 3-point sets."""
-    a = _triangle_pair_angles_deg(vectors_a)
-    b = _triangle_pair_angles_deg(vectors_b)
+    """RMS mismatch between pairwise angular distances of two 3-point sets.
+
+    Order-invariant: sorts the 3 angles to avoid dependence on vertex ordering.
+    """
+    a = np.sort(_triangle_pair_angles_deg(vectors_a))
+    b = np.sort(_triangle_pair_angles_deg(vectors_b))
     diff = a - b
     return float(np.sqrt(np.mean(np.square(diff))))
 
@@ -364,17 +405,28 @@ def estimate_pointing_multi_triangle(
     tolerance=0.015,
     per_triangle_k=3,
     max_fit_rms_deg=5.0,
+    pair_rms_gate_deg=PAIR_RMS_GATE_DEG,
+    max_side_deg=None,
 ):
     """Aggregate multiple triangle hypotheses into one robust coordinate estimate."""
     hypotheses = []
 
+    max_side_limit_deg = max_side_deg
+    if max_side_limit_deg is None:
+        probe_img = cv2.imread(image_path)
+        if probe_img is not None:
+            max_side_limit_deg = fov_diag_limit_deg(fov_x_deg, probe_img.shape)
+
     for t in triangles:
+        # Call find_best_match with 3D ratio features and FOV for max_side_deg filtering.
+        # Orientation is no longer passed; the KD-Tree operates in pure ratio space.
         matches = star_db.find_best_match(
             t['ratio1'],
             t['ratio2'],
             t['ratio3'],
-            t['orientation'],
             tolerance=tolerance,
+            fov_x_deg=fov_x_deg,
+            max_side_deg=max_side_limit_deg,
             k=per_triangle_k,
         )
         if not matches:
@@ -389,12 +441,13 @@ def estimate_pointing_multi_triangle(
                 hip_triangle=m['star_hips'],
                 fov_x_deg=fov_x_deg,
                 observation_time_utc=observation_time_utc,
+                pair_rms_gate_deg=pair_rms_gate_deg,
             )
             if sol is None:
                 continue
             if sol['fit_rms_deg'] > max_fit_rms_deg:
                 continue
-            if float(sol.get('triangle_pair_rms_deg', sol['fit_rms_deg'])) > 1.2:
+            if float(sol.get('triangle_pair_rms_deg', sol['fit_rms_deg'])) > pair_rms_gate_deg:
                 continue
 
             hypotheses.append({
@@ -403,7 +456,7 @@ def estimate_pointing_multi_triangle(
                 'triangle_id': t['triangle_id'],
             })
 
-    if not hypotheses:
+    if len(hypotheses) < 2:
         return None
 
     hips_support = Counter(tuple(sorted(h['solution']['used_hips'])) for h in hypotheses)
@@ -450,7 +503,6 @@ def estimate_pointing_multi_triangle(
         return None
 
     r_eci_agg = weighted_sum / np.linalg.norm(weighted_sum)
-    ra_deg, dec_deg = cartesian_to_ra_dec(r_eci_agg)
 
     now_utc = observation_time_utc or datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
@@ -458,25 +510,106 @@ def estimate_pointing_multi_triangle(
     else:
         now_utc = now_utc.astimezone(timezone.utc)
 
-    r_ecef = eci_to_ecef(r_eci_agg, now_utc)
-    lat_deg, lon_deg = ecef_to_lat_lon_deg(r_ecef)
-
     hypotheses_in = [h for h, ok in zip(hypotheses, best_inliers) if ok]
     fit_values = [h['solution']['fit_rms_deg'] for h in hypotheses_in]
     pair_values = [float(h['solution'].get('triangle_pair_rms_deg', h['solution']['fit_rms_deg'])) for h in hypotheses_in]
-    spread_values = [_vector_angle_deg(h['solution']['r_eci'], r_eci_agg) for h in hypotheses_in]
     best_h = min(hypotheses_in, key=lambda x: x['solution']['fit_rms_deg'])
+
+    r_eci_final = r_eci_agg
+    fit_rms_deg = float(np.mean(fit_values)) if fit_values else 99.0
+    fit_max_deg = float(np.max(fit_values)) if fit_values else 99.0
+    residual_rms = None
+    residual_max = None
+
+    # Use all consensus star correspondences (N>=4) to over-constrain the algebraic solve.
+    img = cv2.imread(image_path)
+    if img is not None:
+        star_by_id = {s.id: s for s in stars}
+        match_votes = defaultdict(Counter)
+
+        for h in hypotheses_in:
+            img_ids = h['solution'].get('image_star_ids')
+            hip_ids = h['solution'].get('matched_hips')
+            if not img_ids or not hip_ids:
+                continue
+            for img_id, hip_id in zip(img_ids, hip_ids):
+                match_votes[img_id][hip_id] += 1
+
+        candidate_pairs = []
+        for img_id, counter in match_votes.items():
+            hip_id, votes = counter.most_common(1)[0]
+            candidate_pairs.append((votes, img_id, hip_id))
+        candidate_pairs.sort(reverse=True)
+
+        pairs = []
+        used_hips = set()
+        for votes, img_id, hip_id in candidate_pairs:
+            if hip_id in used_hips:
+                continue
+            used_hips.add(hip_id)
+            pairs.append((votes, img_id, hip_id))
+
+        strong_pairs = [p for p in pairs if p[0] >= 2]
+        if len(strong_pairs) >= 4:
+            pairs = strong_pairs
+
+        if len(pairs) >= 4:
+            hip_ids = [hip_id for _, _, hip_id in pairs]
+            vectors_map = star_db.get_star_vectors_by_hips(hip_ids)
+            star_vectors = []
+            alphas_deg = []
+
+            for _, img_id, hip_id in pairs:
+                star_obj = star_by_id.get(img_id)
+                vec = vectors_map.get(hip_id)
+                if star_obj is None or vec is None:
+                    continue
+                alphas_deg.append(alpha_from_pixel(star_obj.center, img.shape, fov_x_deg=fov_x_deg))
+                star_vectors.append(vec)
+
+            if len(star_vectors) >= 4:
+                try:
+                    r_ref, residuals = solve_vector_from_angular_constraints(star_vectors, alphas_deg, radius=1.0)
+                    r_ref = normalize_vector(r_ref, radius=1.0)
+
+                    residuals = np.asarray(residuals, dtype=np.float64)
+                    residual_rms = float(np.sqrt(np.mean(np.square(residuals))))
+                    residual_max = float(np.max(np.abs(residuals)))
+
+                    ang_residuals = []
+                    for vec, alpha_obs in zip(star_vectors, alphas_deg):
+                        cos_alpha = float(np.dot(normalize_vector(vec), r_ref))
+                        cos_alpha = max(-1.0, min(1.0, cos_alpha))
+                        alpha_hat = math.degrees(math.acos(cos_alpha))
+                        ang_residuals.append(alpha_hat - alpha_obs)
+                    ang_residuals = np.asarray(ang_residuals, dtype=np.float64)
+                    fit_rms_deg = float(np.sqrt(np.mean(np.square(ang_residuals))))
+                    fit_max_deg = float(np.max(np.abs(ang_residuals)))
+
+                    r_eci_final = r_ref
+                except Exception:
+                    pass
+
+    ra_deg, dec_deg = cartesian_to_ra_dec(r_eci_final)
+    r_ecef = eci_to_ecef(r_eci_final, now_utc)
+    pointing_lat_deg, pointing_lon_deg = ecef_to_lat_lon_deg(r_ecef)
+
+    spread_values = [_vector_angle_deg(h['solution']['r_eci'], r_eci_final) for h in hypotheses_in]
 
     return {
         'ra_deg': ra_deg,
         'dec_deg': dec_deg,
-        'lat_deg': lat_deg,
-        'lon_deg': lon_deg,
-        'r_eci': r_eci_agg,
-        'fit_rms_deg': float(np.mean(fit_values)),
-        'fit_max_deg': float(np.max(fit_values)),
-        'triangle_pair_rms_deg': float(np.mean(pair_values)),
-        'spread_deg': float(np.mean(spread_values)),
+        'lat_deg': pointing_lat_deg,
+        'lon_deg': pointing_lon_deg,
+        'pointing_lat_deg': pointing_lat_deg,
+        'pointing_lon_deg': pointing_lon_deg,
+        'r_eci': r_eci_final,
+        'fit_rms_deg': fit_rms_deg,
+        'fit_max_deg': fit_max_deg,
+        'residual_rms': residual_rms,
+        'residual_max': residual_max,
+        'triangle_pair_rms_deg': float(np.mean(pair_values)) if pair_values else fit_rms_deg,
+        'spread_deg': float(np.mean(spread_values)) if spread_values else 0.0,
         'timestamp_utc': now_utc.isoformat(),
         'used_hips': best_h['solution']['used_hips'],
         'used_hypotheses': len(hypotheses_in),
@@ -486,7 +619,19 @@ def estimate_pointing_multi_triangle(
     }
 
 
-def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0, orientation_sign=1.0):
+def generate_triangles_from_stars(
+    stars,
+    image_shape,
+    fov_x_deg,
+    top_n=10,
+    min_separation_px=12.0,
+):
+    """Generate triangles from image stars using 3D angular distances.
+    
+    Orientation is no longer computed for image triangles, since the KD-Tree
+    now operates in pure 3D ratio space, avoiding incompatibilities between
+    spherical and pixel coordinate conventions.
+    """
     brightest_stars = select_spread_bright_stars(stars, top_n=top_n, min_separation_px=min_separation_px)
 
     triangles_data = []
@@ -494,9 +639,13 @@ def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0, orien
     for star_combo in combinations(brightest_stars, 3):
         s1, s2, s3 = star_combo
 
-        d1 = calculate_distance(s1.center, s2.center)
-        d2 = calculate_distance(s2.center, s3.center)
-        d3 = calculate_distance(s1.center, s3.center)
+        r1 = pixel_to_camera_ray(s1.center, image_shape, fov_x_deg=fov_x_deg)
+        r2 = pixel_to_camera_ray(s2.center, image_shape, fov_x_deg=fov_x_deg)
+        r3 = pixel_to_camera_ray(s3.center, image_shape, fov_x_deg=fov_x_deg)
+
+        d1 = _vector_angle_deg(r1, r2)
+        d2 = _vector_angle_deg(r2, r3)
+        d3 = _vector_angle_deg(r1, r3)
 
         sides = sorted([d1, d2, d3])
         a, b, c = sides[0], sides[1], sides[2]
@@ -518,7 +667,7 @@ def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0, orien
         ratio1 = b / a
         ratio2 = c / a
         ratio3 = b / c if c > 0 else 0.0
-        orientation = orientation_sign * orientation_sign_2d(s1.center, s2.center, s3.center)
+        # Orientation is NO LONGER COMPUTED for image triangles
 
         triangle_id = f"tri_{s1.id}_{s2.id}_{s3.id}"
 
@@ -528,7 +677,7 @@ def generate_triangles_from_stars(stars, top_n=10, min_separation_px=12.0, orien
             'ratio1': ratio1,
             'ratio2': ratio2,
             'ratio3': ratio3,
-            'orientation': orientation
+            # No 'orientation' field
         })
 
     return triangles_data
@@ -558,7 +707,9 @@ if __name__ == "__main__":
             star_db.close()
             exit(1)
 
-        triangles = generate_triangles_from_stars(stars, top_n=8)
+        img_shape = cv2.imread("stars.png").shape
+        max_side_deg = fov_diag_limit_deg(60.0, img_shape)
+        triangles = generate_triangles_from_stars(stars, img_shape, fov_x_deg=60.0, top_n=8)
 
         if not triangles:
             print("Triangles not generated. Too few bright stars?")
@@ -572,12 +723,15 @@ if __name__ == "__main__":
         for i in range(min(3, len(triangles))):
             t = triangles[i]
             print(f"\n  Triangle {i+1}: ratio1={t['ratio1']:.3f}, ratio2={t['ratio2']:.3f}")
+            # Call with 3D ratios and FOV; orientation is no longer used
             matches = star_db.find_best_match(
                 t['ratio1'],
                 t['ratio2'],
                 t['ratio3'],
-                t['orientation'],
-                tolerance=0.015
+                tolerance=0.015,
+                fov_x_deg=60.0,
+                max_side_deg=max_side_deg,
+                k=20
             )
             if matches:
                 matches_found += 1
@@ -591,7 +745,9 @@ if __name__ == "__main__":
         consensus = star_db.find_consensus_matches(
             consensus_triangles,
             tolerance=0.015,
-            per_triangle_k=20
+            per_triangle_k=20,
+            fov_x_deg=60.0,
+            max_side_deg=max_side_deg,
         )
 
         print("\nFinal confidence from multiple triangles:")
@@ -612,15 +768,19 @@ if __name__ == "__main__":
 
             # Robust integration: aggregate several triangle hypotheses.
             try:
+                observation_time_utc = datetime.now(timezone.utc)
+
                 best_solution = estimate_pointing_multi_triangle(
                     star_db=star_db,
                     stars=stars,
                     image_path="stars.png",
                     triangles=triangles,
                     fov_x_deg=60.0,
+                    observation_time_utc=observation_time_utc,
                     tolerance=0.015,
                     per_triangle_k=3,
                     max_fit_rms_deg=6.0,
+                    max_side_deg=max_side_deg,
                 )
 
                 if best_solution is not None:
@@ -630,9 +790,14 @@ if __name__ == "__main__":
                         f"RA={best_solution['ra_deg']:.4f}°, Dec={best_solution['dec_deg']:.4f}°"
                     )
                     print(
-                        f"  Estimated Earth point: lat={best_solution['lat_deg']:.4f}°, "
+                        f"  Observer location: lat={best_solution['lat_deg']:.4f}°, "
                         f"lon={best_solution['lon_deg']:.4f}°"
                     )
+                    if best_solution.get('zenith_ra_deg') is not None:
+                        print(
+                            f"  Zenith RA/Dec: RA={best_solution['zenith_ra_deg']:.4f}°, "
+                            f"Dec={best_solution['zenith_dec_deg']:.4f}°"
+                        )
                     print(
                         f"  fit_rms={best_solution['fit_rms_deg']:.4f}°, "
                         f"fit_max={best_solution['fit_max_deg']:.4f}°, "

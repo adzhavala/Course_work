@@ -21,28 +21,37 @@ class StarMatcher:
         self._build_kdtree()
 
     def _build_kdtree(self):
-        """Load triangle features and build KD-Tree."""
+        """Load triangle features and build KD-Tree.
+        
+        KD-Tree uses only 3D ratio features [ratio1, ratio2, ratio3] to avoid
+        the incompatibility between spherical and pixel orientation conventions.
+        max_side_deg is stored separately for FOV filtering during query.
+        """
         print("Loading triangle catalog from DB and building KD-Tree...")
         cursor = self.conn.cursor()
 
         try:
-            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2, orientation, ratio3 FROM star_triangles")
+            # Read 3 ratios and max_side_deg; orientation is NOT read
+            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3, max_side_deg FROM star_triangles")
         except Exception:
-            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2 FROM star_triangles")
+            # Legacy: try without max_side_deg column
+            cursor.execute("SELECT star1_hip, star2_hip, star3_hip, ratio1, ratio2, ratio3 FROM star_triangles")
         rows = cursor.fetchall()
 
         features = []
         for row in rows:
             hip1, hip2, hip3 = row[0], row[1], row[2]
-            ratio1, ratio2 = row[3], row[4]
-            ratio3 = row[6] if len(row) > 6 and row[6] is not None else (ratio1 / ratio2 if ratio2 else 0.0)
-            orientation = row[5] if len(row) > 5 and row[5] is not None else 0.0
+            ratio1, ratio2, ratio3 = row[3], row[4], row[5]
+            # max_side_deg is the 7th column (index 6) if present, else default to 180°
+            max_side_deg = row[6] if len(row) > 6 and row[6] is not None else 180.0
 
-            feature_vec = np.array([ratio1, ratio2, ratio3, orientation], dtype=np.float64)
+            # 3D feature vector: only ratios, no orientation
+            feature_vec = np.array([ratio1, ratio2, ratio3], dtype=np.float64)
             if not np.all(np.isfinite(feature_vec)):
                 continue
 
-            self.triangles_data.append((hip1, hip2, hip3, orientation))
+            # Store HIP IDs and max_side_deg for post-search filtering
+            self.triangles_data.append((hip1, hip2, hip3, max_side_deg))
             features.append(feature_vec)
 
         if not features:
@@ -52,42 +61,57 @@ class StarMatcher:
             return
 
         self.tree = KDTree(features)
-        print(f"KD-Tree successfully built for {len(features)} figures. Ready for search!")
+        print(f"KD-Tree successfully built for {len(features)} figures (3D ratio space). Ready for search!")
         cursor.close()
 
-    def find_best_match(self, img_ratio1, img_ratio2, img_ratio3, img_orientation, tolerance=0.01, k=20):
-        """Find nearest matches by ratios and orientation."""
-
+    def find_best_match(self, img_ratio1, img_ratio2, img_ratio3, tolerance=0.01, fov_x_deg=60.0, k=20, max_side_deg=None):
+        """Find nearest matches by ratios in 3D feature space.
+        
+        Args:
+            img_ratio1, img_ratio2, img_ratio3: Ratios from image triangle
+            tolerance: Maximum tolerable error (dr1 + dr2 + dr3)
+            fov_x_deg: Image field-of-view; used if max_side_deg is not provided
+            k: Number of nearest neighbors to query
+            max_side_deg: Optional explicit max triangle side angle (degrees)
+        
+        Returns:
+            List of matches with structure {'star_hips': tuple, 'error': float}
+        """
         if self.tree is None:
             return []
 
-        query_pt = [img_ratio1, img_ratio2, img_ratio3, img_orientation]
+        # Query 3D KD-Tree with ratio features only
+        query_pt = [img_ratio1, img_ratio2, img_ratio3]
         distances, indices = self.tree.query(query_pt, k=k)
 
         valid_matches = []
 
-        def score(feature_vec):
-            r1, r2, r3, orient = feature_vec
-            dr1 = abs(r1 - img_ratio1)
-            dr2 = abs(r2 - img_ratio2)
-            dr3 = abs(r3 - img_ratio3)
-            dorient = 0 if orient == 0 or img_orientation == 0 else abs(orient - img_orientation)
-            return dr1 + dr2 + dr3 + 2.0 * dorient
-
         for dist, idx in zip(np.atleast_1d(distances), np.atleast_1d(indices)):
             if idx >= len(self.triangles_data):
                 continue
-            hip1, hip2, hip3, orient = self.triangles_data[idx]
+            
+            hip1, hip2, hip3, db_max_side_deg = self.triangles_data[idx]
+            
+            # FILTER: Reject DB triangles that are too large for the image FOV.
+            # Use an explicit diagonal limit when provided; fall back to a wide factor.
+            limit_deg = max_side_deg if max_side_deg is not None else (fov_x_deg * 1.6)
+            if db_max_side_deg > limit_deg:
+                continue
+            
+            # Compute error as sum of absolute ratio differences
             feature_vec = self.tree.data[idx]
-            if score(feature_vec) <= tolerance:
+            r1, r2, r3 = feature_vec
+            error = abs(r1 - img_ratio1) + abs(r2 - img_ratio2) + abs(r3 - img_ratio3)
+            
+            if error <= tolerance:
                 valid_matches.append({
                     'star_hips': (hip1, hip2, hip3),
-                    'error': score(feature_vec)
+                    'error': error
                 })
 
         return valid_matches
 
-    def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20, min_support=3):
+    def find_consensus_matches(self, triangles, tolerance=0.015, per_triangle_k=20, min_support=2, fov_x_deg=60.0, max_side_deg=None):
         """Aggregate matches from multiple triangles into confidence scores."""
 
         if not triangles:
@@ -101,13 +125,15 @@ class StarMatcher:
         matched_triangles = 0
 
         for t in triangles:
+            # Pass fov_x_deg for max_side_deg filtering; orientation is no longer used
             matches = self.find_best_match(
                 t['ratio1'],
                 t['ratio2'],
                 t['ratio3'],
-                t['orientation'],
                 tolerance=tolerance,
-                k=per_triangle_k
+                fov_x_deg=fov_x_deg,
+                k=per_triangle_k,
+                max_side_deg=max_side_deg,
             )
 
             if not matches:

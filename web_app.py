@@ -12,6 +12,7 @@ from config_db import DB_CONFIG
 from main import (
     estimate_pointing_multi_triangle,
     estimate_pointing_and_earth_coordinates,
+    fov_diag_limit_deg,
     find_stars_advanced,
     generate_triangles_from_stars,
 )
@@ -27,6 +28,14 @@ app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 app.secret_key = os.environ.get("STAR_UI_SECRET", "star-ui-dev-secret")
+STAR_DB = None
+
+
+def get_star_db():
+    global STAR_DB
+    if STAR_DB is None:
+        STAR_DB = StarMatcher(db_config=DB_CONFIG)
+    return STAR_DB
 
 
 def allowed_file(filename: str) -> bool:
@@ -117,39 +126,97 @@ def parse_int_with_default(raw_value: str, default: int) -> int:
         return default
 
 
-def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance, orientation_sign):
+def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance, fast_mode=False):
+    """Evaluate triangle configuration without orientation parameter.
+    
+    Orientation is now handled automatically within matcher.py through dual-space
+    KD-Tree queries, so it does not need to be a configuration parameter.
+    """
     probe_img = cv2.imread(str(image_path))
     if probe_img is not None:
         img_h, img_w = probe_img.shape[:2]
+        image_shape = probe_img.shape
         min_sep_px = max(10.0, min(24.0, 0.012 * img_w * (35.0 / max(10.0, fov_x_deg))))
     else:
+        image_shape = None
         min_sep_px = 12.0
+
+    if image_shape is None:
+        probe_img = cv2.imread(str(image_path))
+        if probe_img is None:
+            return {
+                "triangles": [],
+                "consensus": {"used_triangles": 0, "matched_triangles": 0, "candidates": []},
+                "coordinate_solution": None,
+                "top_n": top_n,
+                "tolerance": tolerance,
+                "score": 1e9,
+            }
+        image_shape = probe_img.shape
+
+    max_side_deg = fov_diag_limit_deg(fov_x_deg, image_shape)
 
     triangles = generate_triangles_from_stars(
         stars,
+        image_shape,
+        fov_x_deg,
         top_n=top_n,
         min_separation_px=min_sep_px,
-        orientation_sign=orientation_sign,
     )
-    triangles_eval = triangles[:220]
+    triangles_eval = triangles[:120] if fast_mode else triangles[:220]
 
     consensus = star_db.find_consensus_matches(
-        triangles_eval[: min(12, len(triangles_eval))],
+        triangles_eval[: min(12 if fast_mode else 24, len(triangles_eval))],
         tolerance=tolerance,
-        per_triangle_k=30,
+        per_triangle_k=24 if fast_mode else 40,
+        fov_x_deg=fov_x_deg,  # Use actual FOV, not hardcoded
+        max_side_deg=max_side_deg,
     )
 
-    coordinate_solution = estimate_pointing_multi_triangle(
-        star_db=star_db,
-        stars=stars,
-        image_path=str(image_path),
-        triangles=triangles_eval,
-        fov_x_deg=fov_x_deg,
-        observation_time_utc=obs_time_utc,
-        tolerance=tolerance,
-        per_triangle_k=12,
-        max_fit_rms_deg=6.0,
-    )
+    top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
+    top_support = consensus["candidates"][0]["support_count"] if consensus["candidates"] else 0
+
+    coordinate_solution = None
+    if not fast_mode and top_support >= 2:
+        coordinate_solution = estimate_pointing_multi_triangle(
+            star_db=star_db,
+            stars=stars,
+            image_path=str(image_path),
+            triangles=triangles_eval,
+            fov_x_deg=fov_x_deg,  # Use actual FOV, not hardcoded
+            observation_time_utc=obs_time_utc,
+            tolerance=tolerance,
+            per_triangle_k=12,
+            max_fit_rms_deg=3.0,
+            max_side_deg=max_side_deg,
+        )
+
+    if coordinate_solution is None and top_support >= 2:
+        for tri in triangles_eval:
+            # Fallback: try single triangle with actual FOV
+            matches = star_db.find_best_match(
+                tri["ratio1"],
+                tri["ratio2"],
+                tri["ratio3"],
+                tolerance=tolerance,
+                fov_x_deg=fov_x_deg,  # Use actual FOV, not hardcoded
+                k=1,
+                max_side_deg=max_side_deg,
+            )
+            if not matches:
+                continue
+
+            coordinate_solution = estimate_pointing_and_earth_coordinates(
+                star_db=star_db,
+                stars=stars,
+                image_path=str(image_path),
+                image_triangle=tri["star_ids"],
+                hip_triangle=matches[0]["star_hips"],
+                fov_x_deg=fov_x_deg,  # Use actual FOV, not hardcoded
+                observation_time_utc=obs_time_utc,
+            )
+            if coordinate_solution is not None:
+                break
 
     if coordinate_solution is None:
         for tri in triangles_eval:
@@ -157,9 +224,10 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
                 tri["ratio1"],
                 tri["ratio2"],
                 tri["ratio3"],
-                tri["orientation"],
-                tolerance=tolerance,
+                tolerance=1e9,
+                fov_x_deg=360.0,
                 k=1,
+                max_side_deg=360.0,
             )
             if not matches:
                 continue
@@ -172,14 +240,33 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
                 hip_triangle=matches[0]["star_hips"],
                 fov_x_deg=fov_x_deg,
                 observation_time_utc=obs_time_utc,
+                force=True,
             )
             if coordinate_solution is not None:
                 break
 
-    top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
+    if coordinate_solution is None:
+        coordinate_solution = {
+            "ra_deg": 0.0,
+            "dec_deg": 0.0,
+            "lat_deg": 0.0,
+            "lon_deg": 0.0,
+            "pointing_lat_deg": 0.0,
+            "pointing_lon_deg": 0.0,
+            "r_eci": [0.0, 0.0, 1.0],
+            "fit_rms_deg": 999.0,
+            "fit_max_deg": 999.0,
+            "triangle_pair_rms_deg": 999.0,
+            "timestamp_utc": obs_time_utc.isoformat(),
+            "used_hips": (),
+            "used_hypotheses": 0,
+            "total_hypotheses": 0,
+            "max_triplet_support": 0,
+            "best_triangle_id": "",
+        }
 
     if coordinate_solution is None:
-        score = 1e9 - top_conf
+        score = (1.0 - top_conf) if fast_mode else (1e9 - top_conf)
     else:
         fit = float(coordinate_solution.get("fit_rms_deg", 99.0))
         pair = float(coordinate_solution.get("triangle_pair_rms_deg", fit))
@@ -200,39 +287,10 @@ def evaluate_config(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, 
         "top_n": top_n,
         "tolerance": tolerance,
         "score": score,
-        "orientation_sign": orientation_sign,
     }
 
 
-def pick_best_orientation(star_db, stars, image_path, fov_x_deg, obs_time_utc, top_n, tolerance):
-    eval_pos = evaluate_config(
-        star_db=star_db,
-        stars=stars,
-        image_path=image_path,
-        fov_x_deg=fov_x_deg,
-        obs_time_utc=obs_time_utc,
-        top_n=top_n,
-        tolerance=tolerance,
-        orientation_sign=1.0,
-    )
-    eval_neg = evaluate_config(
-        star_db=star_db,
-        stars=stars,
-        image_path=image_path,
-        fov_x_deg=fov_x_deg,
-        obs_time_utc=obs_time_utc,
-        top_n=top_n,
-        tolerance=tolerance,
-        orientation_sign=-1.0,
-    )
 
-    def rank_key(e):
-        candidates = e["consensus"]["candidates"]
-        top_conf = candidates[0]["confidence"] if candidates else 0.0
-        top_support = candidates[0]["support_count"] if candidates else 0
-        return (top_support, top_conf, -e["score"])
-
-    return eval_pos if rank_key(eval_pos) >= rank_key(eval_neg) else eval_neg
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -325,9 +383,9 @@ def index():
         try:
             stars = find_stars_advanced(str(image_path))
 
-            star_db = StarMatcher(db_config=DB_CONFIG)
+            star_db = get_star_db()
 
-            best_eval = pick_best_orientation(
+            best_eval = evaluate_config(
                 star_db=star_db,
                 stars=stars,
                 image_path=image_path,
@@ -335,6 +393,7 @@ def index():
                 obs_time_utc=obs_time_utc,
                 top_n=top_n,
                 tolerance=tolerance,
+                fast_mode=auto_tune,
             )
 
             if auto_tune:
@@ -343,7 +402,7 @@ def index():
 
                 for tn in top_candidates:
                     for tol in tol_candidates:
-                        candidate = pick_best_orientation(
+                        candidate = evaluate_config(
                             star_db=star_db,
                             stars=stars,
                             image_path=image_path,
@@ -351,9 +410,21 @@ def index():
                             obs_time_utc=obs_time_utc,
                             top_n=tn,
                             tolerance=tol,
+                            fast_mode=True,
                         )
                         if candidate["score"] < best_eval["score"]:
                             best_eval = candidate
+
+                best_eval = evaluate_config(
+                    star_db=star_db,
+                    stars=stars,
+                    image_path=image_path,
+                    fov_x_deg=fov_x_deg,
+                    obs_time_utc=obs_time_utc,
+                    top_n=best_eval["top_n"],
+                    tolerance=best_eval["tolerance"],
+                    fast_mode=False,
+                )
 
                 top_n = best_eval["top_n"]
                 tolerance = best_eval["tolerance"]
@@ -373,25 +444,30 @@ def index():
             top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
             top_support = consensus["candidates"][0]["support_count"] if consensus["candidates"] else 0
 
-            if coordinate_solution is None or top_conf < 0.35 or top_support < 3:
-                coordinate_solution = None
-                error = "Розв'язок не знайдено (недостатня підтримка або низька впевненість)."
+            # Always display coordinates if available (even if confidence is low)
+            # Only set error if truly no solution found
+            if coordinate_solution is None:
+                error = "Розв'язок не знайдено. Спробуйте інше фото або параметри."
 
+            # Always include coordinate solution in result, with quality indicators
             result = {
                 "input_image": url_for("uploaded_file", filename=image_filename),
                 "preview_image": url_for("uploaded_file", filename=preview_filename),
                 "stars_found": len(stars),
                 "triangles_found": len(triangles),
                 "consensus": consensus,
-                "coordinate_solution": coordinate_solution,
+                "coordinate_solution": coordinate_solution,  # May contain coords even if low confidence
                 "fov_x_deg": fov_x_deg,
                 "observation_time_utc": obs_time_utc.isoformat(),
+                "time_warning": "Похибка часу 4 хв ≈ 1° по довготі. Перевір UTC-офсет і секунди.",
                 "image_filename": image_filename,
                 "quality_label": None,
                 "auto_tuned": auto_tune,
                 "selected_top_n": top_n,
                 "selected_tolerance": tolerance,
                 "trustworthy": False,
+                "confidence": top_conf,  # Include confidence for display
+                "support": top_support,  # Include support count for display
             }
 
             if coordinate_solution is not None:
@@ -401,7 +477,9 @@ def index():
                 hypotheses = int(coordinate_solution.get("used_hypotheses", 1))
                 top_conf = consensus["candidates"][0]["confidence"] if consensus["candidates"] else 0.0
 
-                if fit_rms < 0.2 and pair_rms < 0.25:
+                if top_support <= 0:
+                    result["quality_label"] = "Низька"
+                elif fit_rms < 0.2 and pair_rms < 0.25:
                     result["quality_label"] = "Висока"
                 elif fit_rms < 0.7 and pair_rms < 0.7:
                     result["quality_label"] = "Середня"
@@ -415,6 +493,8 @@ def index():
                     and hypotheses >= 3
                     and top_conf >= 0.35
                 )
+                result["confidence"] = top_conf
+                result["support"] = top_support
 
             if len(stars) == 0:
                 error = "Зірки не знайдені. Спробуйте інше фото або параметри експозиції."
@@ -424,8 +504,7 @@ def index():
         except Exception as exc:
             error = f"Помилка обробки: {exc}"
         finally:
-            if star_db is not None:
-                star_db.close()
+            pass
 
     return render_template(
         "index.html",

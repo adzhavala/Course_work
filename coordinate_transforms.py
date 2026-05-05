@@ -137,6 +137,39 @@ def greenwich_sidereal_time_deg(dt_utc: datetime) -> float:
     return gmst % 360.0
 
 
+def normalize_angle_deg_signed(angle_deg: float) -> float:
+    """Normalize angle to [-180, 180) degrees."""
+    return ((angle_deg + 180.0) % 360.0) - 180.0
+
+
+def calculate_geographic_coordinates(
+    rotation_matrix: Sequence[Sequence[float]],
+    utc_time: datetime,
+    zenith_vector: Sequence[float],
+) -> Tuple[float, float, float, float, float]:
+    """Compute geocentric latitude/longitude from camera-frame zenith.
+
+    rotation_matrix must map camera-frame vectors into the inertial frame.
+    Returns: (lat_deg, lon_deg, ra_z_deg, dec_z_deg, gmst_deg)
+    """
+    rot = np.asarray(rotation_matrix, dtype=np.float64)
+    if rot.shape != (3, 3):
+        raise ValueError("rotation_matrix must be 3x3")
+
+    z_cam = normalize_vector(zenith_vector, radius=1.0)
+    z_eci = normalize_vector(rot @ z_cam, radius=1.0)
+
+    ra_deg, dec_deg = cartesian_to_ra_dec(z_eci)
+    gmst_deg = greenwich_sidereal_time_deg(utc_time)
+
+    # Geocentric latitude equals zenith declination in the inertial frame.
+    lat_deg = dec_deg
+    # Longitude: lambda = alpha - GMST, normalized to [-180, 180).
+    lon_deg = normalize_angle_deg_signed(ra_deg - gmst_deg)
+
+    return lat_deg, lon_deg, ra_deg, dec_deg, gmst_deg
+
+
 def eci_to_ecef(v_eci: Sequence[float], dt_utc: datetime, rotation_sign: float = 1.0) -> np.ndarray:
     """Rotate vector from Earth-centered inertial frame to Earth-fixed frame."""
     theta = rotation_sign * math.radians(greenwich_sidereal_time_deg(dt_utc))
