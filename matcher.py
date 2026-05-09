@@ -7,6 +7,9 @@ from coordinate_transforms import ra_dec_to_cartesian
 
 
 class StarMatcher:
+    _cached_tree = None
+    _cached_triangles_data = None
+
     def __init__(self, db_config=None, db_password=None):
         """Initialize matcher and load triangle index."""
         if db_config:
@@ -18,7 +21,14 @@ class StarMatcher:
         self.tree = None
         self.triangles_data = []
 
-        self._build_kdtree()
+        if StarMatcher._cached_tree is not None and StarMatcher._cached_triangles_data is not None:
+            self.tree = StarMatcher._cached_tree
+            self.triangles_data = StarMatcher._cached_triangles_data
+        else:
+            self._build_kdtree()
+            if self.tree is not None and self.triangles_data:
+                StarMatcher._cached_tree = self.tree
+                StarMatcher._cached_triangles_data = self.triangles_data
 
     def _build_kdtree(self):
         """Load triangle features and build KD-Tree.

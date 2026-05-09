@@ -67,9 +67,6 @@
               required
             />
           </label>
-          <div class="hint">
-            FOV у градусах зі Stellarium (не фокусна відстань).
-          </div>
 
           <label>
             Кількість яскравих зір (top_n)
@@ -97,21 +94,22 @@
           </label>
 
           <label>
-            Час знімка + UTC-офсет
+            UTC час спостереження (ISO, опціонально)
             <input
               type="text"
               name="observation_time_utc"
               value="{{ form_values.observation_time_utc }}"
-              placeholder="2026-04-26 21:15:00 +03:00"
+              placeholder="2026-04-26T21:15:00+00:00"
             />
           </label>
 
           <label class="checkbox-line">
-            {% if form_values.auto_tune == "on" %}
-            <input type="checkbox" name="auto_tune" checked />
-            {% else %}
-            <input type="checkbox" name="auto_tune" />
-            {% endif %} Автопідбір top_n / tolerance
+            <input
+              type="checkbox"
+              name="auto_tune"
+              {% if form_values.auto_tune == "on" %}checked{% endif %}
+            />
+            Автопідбір top_n / tolerance
           </label>
 
           <button type="submit">Запустити аналіз</button>
@@ -146,9 +144,8 @@
           </div>
           {% endif %}
         </div>
-        {% if result.time_warning %}
-        <div class="hint">{{ result.time_warning }}</div>
-        {% endif %} {% if result.consensus and result.consensus.candidates %}
+
+        {% if result.consensus and result.consensus.candidates %}
         <div class="card">
           <h3>Топ кандидат</h3>
           {% set c = result.consensus.candidates[0] %}
@@ -166,62 +163,18 @@
             Dec: <b>{{ '%.4f'|format(result.coordinate_solution.dec_deg) }}°</b>
           </p>
           <p>
-            Optical Axis Subpoint / Zenith Location (Lat):
-            <b>{{ '%.4f'|format(result.coordinate_solution.lat_deg) }}°</b>
+            Lat: <b>{{ '%.4f'|format(result.coordinate_solution.lat_deg) }}°</b>
           </p>
           <p>
-            Optical Axis Subpoint / Zenith Location (Lon):
-            <b>{{ '%.4f'|format(result.coordinate_solution.lon_deg) }}°</b>
+            Lon: <b>{{ '%.4f'|format(result.coordinate_solution.lon_deg) }}°</b>
           </p>
-          <p>FOV: <b>{{ result.fov_x_deg }}°</b> (по горизонталі)</p>
-          {% if result.confidence is defined %}
-          <p>
-            Впевненість: <b>{{ '%.3f'|format(result.confidence) }}</b> |
-            Підтримка: <b>{{ result.support }}</b>
-          </p>
-          {% endif %}
-          <p>
-            Fit RMS:
-            <b>{{ '%.4f'|format(result.coordinate_solution.fit_rms_deg) }}°</b>
-          </p>
-          <p>
-            Fit Max:
-            <b>{{ '%.4f'|format(result.coordinate_solution.fit_max_deg) }}°</b>
-          </p>
-          {% if result.coordinate_solution.triangle_pair_rms_deg is defined %}
-          <p>
-            Pair RMS:
-            <b
-              >{{
-              '%.4f'|format(result.coordinate_solution.triangle_pair_rms_deg)
-              }}°</b
-            >
-          </p>
-          {% endif %} {% if result.coordinate_solution.spread_deg is defined %}
-          <p>
-            Spread:
-            <b>{{ '%.4f'|format(result.coordinate_solution.spread_deg) }}°</b>
-          </p>
-          {% endif %} {% if result.coordinate_solution.used_hypotheses is
-          defined %}
-          <p>
-            Гіпотез: <b>{{ result.coordinate_solution.used_hypotheses }}</b>
-          </p>
-          {% endif %} {% if result.coordinate_solution.total_hypotheses is
-          defined %}
-          <p>
-            Всього гіпотез:
-            <b>{{ result.coordinate_solution.total_hypotheses }}</b>
-          </p>
-          {% endif %} {% if result.quality_label %} {% if
-          result.coordinate_solution.max_triplet_support is defined %}
-          <p>
-            Підтримка HIP-трійки:
-            <b>{{ result.coordinate_solution.max_triplet_support }}</b>
-          </p>
-          {% endif %}
+          {% if result.quality_label %}
           <p>Якість: <b>{{ result.quality_label }}</b></p>
           {% endif %}
+        </div>
+        {% else %}
+        <div class="card muted">
+          Координатний розв'язок не обчислено для цього кадру.
         </div>
         {% endif %}
 
